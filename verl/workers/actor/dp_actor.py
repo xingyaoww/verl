@@ -164,4 +164,6 @@ class DataParallelPPOActor(BasePPOActor):
             data = {'actor/grad_norm': grad_norm.detach().item()}
             append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
         return metrics

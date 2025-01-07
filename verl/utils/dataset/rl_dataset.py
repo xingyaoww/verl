@@ -22,6 +22,8 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizer
+
+from verl import DataProto
 from verl.utils.fs import copy_local_path_from_hdfs
 
 from verl.utils.model import compute_position_id_with_mask
@@ -143,3 +145,40 @@ class RLHFDataset(Dataset):
             row_dict['raw_prompt'] = chat.tolist()
 
         return row_dict
+
+
+class BufferedDataLoader:
+    def __init__(self, dataloader):
+        self.dataloader = dataloader
+        self.batch_size = dataloader.batch_size
+        self.buffer = []
+        self.dataloader_iter = None
+
+    def start_new_epoch(self):
+        """Reset for new epoch"""
+        self.dataloader_iter = iter(self.dataloader)
+
+    def get_next_batch(self):
+        try:
+            return next(self.dataloader_iter)
+        except StopIteration:
+            raise StopIteration
+
+    def __len__(self):
+        return len(self.dataloader)
+
+    def add_to_buffer(self, samples):
+        if len(self.buffer) == 0:
+            self.buffer = samples
+        else:
+            self.buffer = DataProto.concat([self.buffer, samples])
+
+    def get_from_buffer(self, count, dp_size):
+        if count > self.buffer_size():
+            count = (self.buffer_size() // dp_size) * dp_size
+        samples = self.buffer.slice(range(0, count))
+        self.buffer = self.buffer.slice(range(count, self.buffer_size()))
+        return samples
+
+    def buffer_size(self):
+        return len(self.buffer)
