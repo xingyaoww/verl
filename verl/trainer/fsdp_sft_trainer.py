@@ -43,6 +43,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.debug import log_gpu_memory_usage
+from peft import LoraConfig, TaskType, get_peft_model
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_SFT_LOGGING_LEVEL', 'WARN'))
@@ -158,6 +159,10 @@ class FSDPSFTTrainer(object):
                                                                                torch_dtype=torch.float32,
                                                                                attn_implementation='flash_attention_2',
                                                                                trust_remote_code=trust_remote_code)
+            
+            if self.config.model.get('lora_rank', 0) > 0:
+                self.model.enable_input_require_grads()
+                self.model = get_peft_model(self.model, LoraConfig(task_type=TaskType.CAUSAL_LM, r=self.config.model.lora_rank, lora_alpha=self.config.model.lora_alpha, target_modules=self.config.model.target_modules, bias="none"))
 
         if self.config.model.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})

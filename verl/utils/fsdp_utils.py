@@ -37,7 +37,9 @@ def get_init_weight_context_manager(use_meta_tensor=True):
 
 # Copyright 2020-present the HuggingFace Inc. team.
 # Adapted from https://github.com/huggingface/transformers/src/transformers/trainer.py
+# and https://github.com/huggingface/peft/blob/63ae263644b9a2527dccd1970bd934e317a6173e/src/peft/utils/other.py#L508C5-L508C26
 def get_fsdp_wrap_policy(module, config=None):
+    # should work for both transformers lib models and peft lib models
     if config is None:
         config = {}
 
@@ -49,8 +51,24 @@ def get_fsdp_wrap_policy(module, config=None):
                                                     default_transformer_cls_names_to_wrap)
     min_num_params = config.get('min_num_params', 0)
     auto_wrap_policy = None
+    
+    policies = []
+    
+    from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy, transformer_auto_wrap_policy
+    def lambda_policy_fn(module):
+        if (
+            len(list(module.named_children())) == 0
+            and getattr(module, "weight", None) is not None
+            and module.weight.requires_grad
+        ):
+            return True
+        return False
+    lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
+    policies.append(lambda_policy)
+
     if min_num_params > 0:
-        auto_wrap_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=min_num_params)
+        size_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=min_num_params)
+        policies.append(size_policy)
     elif fsdp_transformer_layer_cls_to_wrap is not None:
         transformer_cls_to_wrap = set()
         for layer_class in fsdp_transformer_layer_cls_to_wrap:
@@ -60,13 +78,16 @@ def get_fsdp_wrap_policy(module, config=None):
             else:
                 transformer_cls_to_wrap.add(transformer_cls)
 
-        auto_wrap_policy = functools.partial(
+        transformer_policy = functools.partial(
             transformer_auto_wrap_policy,
-            # Transformer layer class to wrap
             transformer_layer_cls=transformer_cls_to_wrap,
         )
-    return auto_wrap_policy
+        policies.append(transformer_policy)
 
+    if len(policies) > 0:
+        auto_wrap_policy = functools.partial(_or_policy, policies=policies)
+        
+    return auto_wrap_policy
 
 def offload_fsdp_grad(module):
     for _, param in module.named_parameters():
