@@ -56,6 +56,18 @@ def extract_step(path):
     return None
 
 
+def convert_to_regular_types(obj):
+    """Convert Hydra configs and other special types to regular Python types."""
+    from omegaconf import ListConfig, DictConfig
+    if isinstance(obj, (ListConfig, DictConfig)):
+        return {k: convert_to_regular_types(v) for k, v in obj.items()} if isinstance(obj, DictConfig) else list(obj)
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_regular_types(x) for x in obj]
+    elif isinstance(obj, dict):
+        return {k: convert_to_regular_types(v) for k, v in obj.items()}
+    return obj
+
+
 class FSDPSFTTrainer(object):
 
     def __init__(self, config, device_mesh: DeviceMesh):
@@ -162,7 +174,15 @@ class FSDPSFTTrainer(object):
             
             if self.config.model.get('lora_rank', 0) > 0:
                 self.model.enable_input_require_grads()
-                self.model = get_peft_model(self.model, LoraConfig(task_type=TaskType.CAUSAL_LM, r=self.config.model.lora_rank, lora_alpha=self.config.model.lora_alpha, target_modules=self.config.model.target_modules, bias="none"))
+                # Convert config to regular Python types before creating PEFT model
+                lora_config = {
+                    'task_type': TaskType.CAUSAL_LM,
+                    'r': self.config.model.lora_rank,
+                    'lora_alpha': self.config.model.lora_alpha,
+                    'target_modules': convert_to_regular_types(self.config.model.target_modules),
+                    'bias': "none"
+                }
+                self.model = get_peft_model(self.model, LoraConfig(**lora_config))
 
         if self.config.model.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
