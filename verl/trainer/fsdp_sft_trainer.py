@@ -99,7 +99,8 @@ class FSDPSFTTrainer(object):
                                         response_key=config.data.response_key,
                                         response_dict_keys=config.data.get('response_dict_keys', None),
                                         max_length=config.data.max_length,
-                                        truncation=config.data.truncation)
+                                        truncation=config.data.truncation,
+                                        skip_template_apply=config.data.skip_template_apply)
         self.val_dataset = SFTDataset(parquet_files=config.data.val_files,
                                       tokenizer=self.tokenizer,
                                       prompt_key=config.data.prompt_key,
@@ -107,7 +108,8 @@ class FSDPSFTTrainer(object):
                                       response_key=config.data.response_key,
                                       response_dict_keys=config.data.get('response_dict_keys', None),
                                       max_length=config.data.max_length,
-                                      truncation=config.data.truncation)
+                                      truncation=config.data.truncation,
+                                      skip_template_apply=config.data.skip_template_apply)
 
         # build dataloader
         rank = self.device_mesh.get_rank()
@@ -151,6 +153,12 @@ class FSDPSFTTrainer(object):
 
         # This may be very large
         init_context = get_init_weight_context_manager(use_meta_tensor=not config.tie_word_embeddings)
+
+        # Perform RoPE scaling when self.config.model.rope_scaling is not None
+        model_kwargs = {}
+        if 'rope_scaling' in self.config.model and self.config.model.rope_scaling is not None:
+            model_kwargs['rope_scaling'] = dict(self.config.model.rope_scaling)
+            print(f'rope_scaling setted. rope_scaling={model_kwargs["rope_scaling"]}')
 
         with init_context():
             self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(local_model_path,
