@@ -50,7 +50,7 @@ def sync_model_parameters_global(layer):
 def test_hf_casual_fwd():
     assert torch.cuda.device_count() >= 2, "need at least 2 gpus for test"
 
-    sp_size = 8
+    sp_size = 2
     dp_size = 1
     ulysses_device_mesh = init_device_mesh(device_type='cuda',
                                            mesh_shape=(dp_size, sp_size),
@@ -128,7 +128,7 @@ def test_hf_casual_fwd():
 def test_hf_casual_fwd_bwd():
     assert torch.cuda.device_count() >= 2, "need at least 2 gpus for test"
 
-    sp_size = 8
+    sp_size = 2
     dp_size = 1
     ulysses_device_mesh = init_device_mesh(device_type='cuda',
                                            mesh_shape=(dp_size, sp_size),
@@ -216,5 +216,6 @@ def test_hf_casual_fwd_bwd():
 
 if __name__ == '__main__':
     local_rank, rank, world_size = initialize_global_process_group()
+    print(f'local_rank: {local_rank}, rank: {rank}, world_size: {world_size}')
     test_hf_casual_fwd()
     test_hf_casual_fwd_bwd()
