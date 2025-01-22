@@ -26,6 +26,7 @@ optim:
   weight_decay: 0.01
   warmup_steps_ratio: 0.1
   clip_grad: 1.0
+  label_smoothing: 0.0
 
 trainer:
   default_local_dir: /tmp/sft_model

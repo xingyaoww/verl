@@ -259,7 +259,10 @@ class FSDPSFTTrainer(object):
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels.contiguous()
         # Flatten the tokens
-        loss_fct = nn.CrossEntropyLoss(reduction='none')
+        loss_fct = nn.CrossEntropyLoss(
+            reduction='none',
+            label_smoothing=self.config.optim.label_smoothing,
+        )
         shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
         shift_labels = shift_labels.view(-1)
         # Enable model parallelism
