@@ -444,7 +444,6 @@ class FSDPSFTTrainer(object):
                 assert self.use_remove_padding == False and self.config.ulysses_sequence_parallel_size == 1
                 loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
             step_loss += loss.item()
-            debug_print(f'step_loss: {step_loss}')
 
         self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
 
