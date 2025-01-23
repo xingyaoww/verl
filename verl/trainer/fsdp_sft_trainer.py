@@ -156,16 +156,16 @@ class FSDPSFTTrainer(object):
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
 
-        # # If doing SP, we need to use the local rank and size
-        # if self.config.ulysses_sequence_parallel_size > 1:
-        #     rank = self.ulysses_device_mesh.get_local_rank('dp')
-        #     world_size = self.ulysses_device_mesh.size(0)
-        #     if self.ulysses_device_mesh.get_rank() == 0:
-        #         print(f'Using SP rank {rank} and size {world_size} for data distribution')
-        #         print(f'Each SP rank gets different data')
-        # else:
-        rank = self.device_mesh.get_rank()
-        world_size = self.device_mesh.size()
+        # If doing SP, we need to use the local rank and size
+        if self.config.ulysses_sequence_parallel_size > 1:
+            rank = self.ulysses_device_mesh.get_local_rank('dp')
+            world_size = self.ulysses_device_mesh.size(0)
+            if self.ulysses_device_mesh.get_rank() == 0:
+                print(f'Using SP rank {rank} and size {world_size} for data distribution')
+                print(f'Each SP rank gets different data, but the same data WITHIN the same rank')
+        else:
+            rank = self.device_mesh.get_rank()
+            world_size = self.device_mesh.size()
         if self.device_mesh.get_rank() == 0:
             print(f'Using FSDP rank {rank} and size {world_size} for data distribution')
 
@@ -303,7 +303,7 @@ class FSDPSFTTrainer(object):
                                                             num_warmup_steps=num_warmup_steps,
                                                             num_training_steps=total_steps)
 
-    def _compute_loss_and_backward(self, batch):
+    def _compute_loss_and_backward(self, batch, do_backward=True):
         loss_mask = batch.pop('loss_mask')[:, :-1].reshape(-1).cuda()
         labels = batch['input_ids'][:, 1:].cuda()
 
@@ -338,29 +338,28 @@ class FSDPSFTTrainer(object):
             dp_size = 1
 
         loss = torch.sum(loss) / valid_token_this_rank * dp_size  # possible bugs here for dp
-        loss.backward()
+        if do_backward:
+            loss.backward()
         return loss
 
-    def _compute_loss_and_backward_sp(self, batch):
+    def _compute_loss_and_backward_sp(self, batch, do_backward=True):
         """Compute loss with ulysses sequence parallelism and remove padding features enabled"""
-        debug_print(f'batch (before preprocess): {batch}')
-        model_inputs = DataProto.from_dict(batch)
         with self.sharding_manager:
-            # This will all-gather batch inside all SP ranks
-            model_inputs = self.sharding_manager.preprocess_data(model_inputs)
-
+            # IMPORTANT: We have a big assumption here, so we can shard the SAME sequence across SP ranks
+            # i.e., each GPU has <1 sequence, and each SP group has 1 sequence
+            # 1. All SP ranks will receive the *SAME* batch
+            # 2. Different SP groups will receive *DIFFERENT* batches
+            # This is implemented by the DistributedSampler
+            input_ids = batch['input_ids'].cuda()
+            batch_size, seqlen = input_ids.shape
+            attention_mask = batch['attention_mask'].cuda()
+            position_ids = batch['position_ids'].cuda()
+            loss_mask = batch['loss_mask'][:, :-1].reshape(-1).cuda()
+            # debug_print(f'input_ids: {input_ids.shape}. Middle 10: {input_ids[:, 1000:1010]}, device: {input_ids.device}')
+            # debug_print(f'attention_mask: {attention_mask.shape}, device: {attention_mask.device}')
+            # debug_print(f'position_ids: {position_ids.shape}. Middle 10: {position_ids[:, 1000:1010]}, device: {position_ids.device}')
+            # debug_print(f'loss_mask: {loss_mask.shape}, device: {loss_mask.device}')
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                batch = model_inputs.batch
-                debug_print(f'batch (after preprocess): {batch}')
-                input_ids = batch['input_ids']
-                batch_size, seqlen = input_ids.shape
-                attention_mask = batch['attention_mask']
-                position_ids = batch['position_ids']
-                loss_mask = batch['loss_mask'][:, :-1].reshape(-1)
-                debug_print(f'input_ids: {input_ids.shape}. Middle 10: {input_ids[:, 1000:1010]}')
-                debug_print(f'attention_mask: {attention_mask.shape}')
-                debug_print(f'position_ids: {position_ids.shape}. Middle 10: {position_ids[:, 1000:1010]}')
-                debug_print(f'loss_mask: {loss_mask.shape}')
 
                 # Remove padding
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
@@ -377,8 +376,7 @@ class FSDPSFTTrainer(object):
                     input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size()
                     # self.config.ulysses_sequence_parallel_size
                 )
-                debug_print(f'input_ids_rmpad_sliced: {input_ids_rmpad_sliced.shape}. Middle 10: {input_ids_rmpad_sliced[:, 1000:1010]}')
-                debug_print(f'position_ids_rmpad_padded: {position_ids_rmpad_padded.shape}. Middle 10: {position_ids_rmpad_padded[:, 1000:1010]}')
+                # debug_print(f'input_ids_rmpad: {input_ids_rmpad.shape}; input_ids_rmpad_sliced: {input_ids_rmpad_sliced.shape}. Middle 10: {input_ids_rmpad_sliced[:, 1000:1010]}; position_ids_rmpad_padded: {position_ids_rmpad_padded.shape}. Middle 10: {position_ids_rmpad_padded[:, 1000:1010]}')
                 # For computing loss
                 input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
                 input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
@@ -386,7 +384,7 @@ class FSDPSFTTrainer(object):
                 )
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
-                debug_print(f'device_mesh: {self.device_mesh.get_rank()}, self.ulysses_device_mesh: {self.ulysses_device_mesh.get_rank()}, SP input_ids_rmpad_sliced: {input_ids_rmpad_sliced.shape} (device: {input_ids_rmpad_sliced.device}), position_ids_rmpad_padded: {position_ids_rmpad_padded.shape} (device: {position_ids_rmpad_padded.device})')
+                # debug_print(f'device_mesh: {self.device_mesh.get_rank()}, self.ulysses_device_mesh: {self.ulysses_device_mesh.get_rank()}, SP input_ids_rmpad_sliced: {input_ids_rmpad_sliced.shape} (device: {input_ids_rmpad_sliced.device}), position_ids_rmpad_padded: {position_ids_rmpad_padded.shape} (device: {position_ids_rmpad_padded.device})')
                 
                 # Forward pass
                 debug_print(f'BEFORE forward. input_ids_rmpad_sliced: {input_ids_rmpad_sliced.shape} (device: {input_ids_rmpad_sliced.device}): FIRST 10: {input_ids_rmpad_sliced[:, :10]}')
@@ -429,14 +427,16 @@ class FSDPSFTTrainer(object):
                 full_loss = pad_input(hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen)
                 full_loss = full_loss.squeeze(-1)[:, :-1]  # Remove last token's loss
                 full_loss = full_loss.reshape(-1)
-                debug_print(f'full_loss: {full_loss.shape}')
+                # debug_print(f'full_loss: {full_loss.shape} (device: {full_loss.device}), loss_mask: {loss_mask.shape} (device: {loss_mask.device})')
+                loss_mask = loss_mask.to(full_loss.device)
                 loss = full_loss * loss_mask
                 valid_token_this_rank = torch.sum(loss_mask)
 
                 if self.config.data.balance_dp_token:
                     debug_print("Balance DP token is on")
                     torch.distributed.all_reduce(valid_token_this_rank)  # becomes total valid tokens in all ranks
-                    dp_size = torch.distributed.get_world_size()
+                    assert self.ulysses_device_mesh is not None
+                    dp_size = self.ulysses_device_mesh.size('dp')
                 else:
                     dp_size = 1
 
@@ -445,7 +445,8 @@ class FSDPSFTTrainer(object):
                 
                 # IMPORTANT: WE need to DO BACKWARD inside _compute_loss_and_backward_sp (within the sharding manager)
                 # Otherwise, the backward+grad checkpoint won't use grad checkpoint properly
-                loss.backward()
+                if do_backward:
+                    loss.backward()
             return loss
 
     def training_step(self, batch: TensorDict):
@@ -494,7 +495,11 @@ class FSDPSFTTrainer(object):
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()
         with torch.no_grad():
-            loss = self._compute_loss_and_backward(batch)
+            if self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1:
+                loss = self._compute_loss_and_backward_sp(batch, do_backward=False)
+            else:
+                assert self.use_remove_padding == False and self.config.ulysses_sequence_parallel_size == 1
+                loss = self._compute_loss_and_backward(batch, do_backward=False)
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         return loss
 
