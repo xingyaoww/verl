@@ -180,7 +180,7 @@ class FSDPSFTTrainer(object):
                                            num_workers=8,
                                            pin_memory=True,
                                            drop_last=True)
-
+        debug_print(f'sampler initialized with num_replicas: {world_size}, rank: {rank}, drop_last: {True}')
         self.val_sampler = DistributedSampler(self.val_dataset,
                                               shuffle=True,
                                               num_replicas=world_size,
@@ -303,7 +303,7 @@ class FSDPSFTTrainer(object):
                                                             num_warmup_steps=num_warmup_steps,
                                                             num_training_steps=total_steps)
 
-    def _compute_loss(self, batch):
+    def _compute_loss_and_backward(self, batch):
         loss_mask = batch.pop('loss_mask')[:, :-1].reshape(-1).cuda()
         labels = batch['input_ids'][:, 1:].cuda()
 
@@ -338,9 +338,10 @@ class FSDPSFTTrainer(object):
             dp_size = 1
 
         loss = torch.sum(loss) / valid_token_this_rank * dp_size  # possible bugs here for dp
+        loss.backward()
         return loss
 
-    def _compute_loss_sp(self, batch):
+    def _compute_loss_and_backward_sp(self, batch):
         """Compute loss with ulysses sequence parallelism and remove padding features enabled"""
         debug_print(f'batch (before preprocess): {batch}')
         model_inputs = DataProto.from_dict(batch)
@@ -356,9 +357,9 @@ class FSDPSFTTrainer(object):
                 attention_mask = batch['attention_mask']
                 position_ids = batch['position_ids']
                 loss_mask = batch['loss_mask'][:, :-1].reshape(-1)
-                debug_print(f'input_ids: {input_ids.shape}. Middle 10: {input_ids[:, 100:110]}')
+                debug_print(f'input_ids: {input_ids.shape}. Middle 10: {input_ids[:, 1000:1010]}')
                 debug_print(f'attention_mask: {attention_mask.shape}')
-                debug_print(f'position_ids: {position_ids.shape}. Middle 10: {position_ids[:, 100:110]}')
+                debug_print(f'position_ids: {position_ids.shape}. Middle 10: {position_ids[:, 1000:1010]}')
                 debug_print(f'loss_mask: {loss_mask.shape}')
 
                 # Remove padding
@@ -376,8 +377,8 @@ class FSDPSFTTrainer(object):
                     input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size()
                     # self.config.ulysses_sequence_parallel_size
                 )
-                debug_print(f'input_ids_rmpad_sliced: {input_ids_rmpad_sliced.shape}. First 10: {input_ids_rmpad_sliced[:, :10]}, Last 10: {input_ids_rmpad_sliced[:, -10:]}')
-                debug_print(f'position_ids_rmpad_padded: {position_ids_rmpad_padded.shape}. First 10: {position_ids_rmpad_padded[:, :10]}, Last 10: {position_ids_rmpad_padded[:, -10:]}')
+                debug_print(f'input_ids_rmpad_sliced: {input_ids_rmpad_sliced.shape}. Middle 10: {input_ids_rmpad_sliced[:, 1000:1010]}')
+                debug_print(f'position_ids_rmpad_padded: {position_ids_rmpad_padded.shape}. Middle 10: {position_ids_rmpad_padded[:, 1000:1010]}')
                 # For computing loss
                 input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
                 input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
@@ -388,12 +389,14 @@ class FSDPSFTTrainer(object):
                 debug_print(f'device_mesh: {self.device_mesh.get_rank()}, self.ulysses_device_mesh: {self.ulysses_device_mesh.get_rank()}, SP input_ids_rmpad_sliced: {input_ids_rmpad_sliced.shape} (device: {input_ids_rmpad_sliced.device}), position_ids_rmpad_padded: {position_ids_rmpad_padded.shape} (device: {position_ids_rmpad_padded.device})')
                 
                 # Forward pass
+                debug_print(f'BEFORE forward. input_ids_rmpad_sliced: {input_ids_rmpad_sliced.shape} (device: {input_ids_rmpad_sliced.device}): FIRST 10: {input_ids_rmpad_sliced[:, :10]}')
                 output = self.fsdp_model(
                     input_ids=input_ids_rmpad_sliced,
                     attention_mask=None,  # Not needed with flash attention varlen
                     position_ids=position_ids_rmpad_padded,
                     use_cache=False
                 )
+                debug_print(f'AFTER forward. output: {output.logits.shape}')
                 
                 # Compute loss
                 loss_fct = nn.CrossEntropyLoss(
@@ -401,26 +404,26 @@ class FSDPSFTTrainer(object):
                     label_smoothing=self.config.optim.label_smoothing
                 )
                 
-                # Approach 1: Gather COMPLETE logprobs first
-                logits_split_in_seq = output.logits
-                logits_full = gather_outpus_and_unpad(logits_split_in_seq, gather_dim=1, unpad_dim=1, padding_size=pad_size)
-                debug_print(f'logits_full: {logits_full.shape}, input_ids_rmpad: {input_ids_rmpad.shape}, input_ids_rmpad_rolled: {input_ids_rmpad_rolled.shape}')
-                loss = loss_fct(logits_full.squeeze(0), input_ids_rmpad.squeeze(0))
-                debug_print(f'loss: {loss.shape}, loss_mask: {loss_mask.shape}')
+                # # Approach 1: Gather COMPLETE logprobs first
+                # logits_split_in_seq = output.logits
+                # logits_full = gather_outpus_and_unpad(logits_split_in_seq, gather_dim=1, unpad_dim=1, padding_size=pad_size)
+                # debug_print(f'logits_full: {logits_full.shape}, input_ids_rmpad: {input_ids_rmpad.shape}, input_ids_rmpad_rolled: {input_ids_rmpad_rolled.shape}')
+                # loss = loss_fct(logits_full.squeeze(0), input_ids_rmpad.squeeze(0))
+                # debug_print(f'loss: {loss.shape}, loss_mask: {loss_mask.shape}')
 
                 # They indeed match!
                 # basically computing the loss on the current slice of sequence/labels
 
-                # # Approach 2: Calculate locally then aggregate
-                # logits_rmpad = output.logits.squeeze(0)
-                # input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
-                # debug_print(f'logits_rmpad: {logits_rmpad.shape}, input_ids_rmpad_rolled: {input_ids_rmpad_rolled.shape}')
-                # loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
-                # # loss = loss_fct(logits_full, input_ids_rmpad)
-                # debug_print(f'loss: {loss.shape}')
-                # # Gather and unpad for sequence parallelism
-                # loss = gather_outpus_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-                # debug_print(f'loss (gathered): {loss.shape}, loss_mask: {loss_mask.shape}')
+                # Approach 2: Calculate locally then aggregate
+                logits_rmpad = output.logits.squeeze(0)
+                input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
+                debug_print(f'logits_rmpad: {logits_rmpad.shape}, input_ids_rmpad_rolled: {input_ids_rmpad_rolled.shape}')
+                loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
+                # loss = loss_fct(logits_full, input_ids_rmpad)
+                debug_print(f'loss: {loss.shape}')
+                # Gather and unpad for sequence parallelism
+                loss = gather_outpus_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+                debug_print(f'loss (gathered): {loss.shape}, loss_mask: {loss_mask.shape}')
                 
                 # This is the loss collected from all ulysses ranks
                 full_loss = pad_input(hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen)
@@ -439,6 +442,10 @@ class FSDPSFTTrainer(object):
 
                 loss = torch.sum(loss) / valid_token_this_rank * dp_size
                 debug_print(f'loss (after reduction): {loss.shape}, {loss}')
+                
+                # IMPORTANT: WE need to DO BACKWARD inside _compute_loss_and_backward_sp (within the sharding manager)
+                # Otherwise, the backward+grad checkpoint won't use grad checkpoint properly
+                loss.backward()
             return loss
 
     def training_step(self, batch: TensorDict):
@@ -458,14 +465,12 @@ class FSDPSFTTrainer(object):
         for micro_batch in micro_batches:
             if self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1:
                 # micro_batch = micro_batch.to('cuda')
-                loss = self._compute_loss_sp(batch=micro_batch) / n_micro_batches
+                loss = self._compute_loss_and_backward_sp(batch=micro_batch) / n_micro_batches
             else:
                 assert self.use_remove_padding == False and self.config.ulysses_sequence_parallel_size == 1
-                loss = self._compute_loss(batch=micro_batch) / n_micro_batches
-            debug_print(f'before backward')
-            loss.backward()
-            debug_print(f'after backward')
+                loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
             step_loss += loss.item()
+            debug_print(f'step_loss: {step_loss}')
 
         self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
 
@@ -489,7 +494,7 @@ class FSDPSFTTrainer(object):
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()
         with torch.no_grad():
-            loss = self._compute_loss(batch)
+            loss = self._compute_loss_and_backward(batch)
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         return loss
 
@@ -531,8 +536,8 @@ class FSDPSFTTrainer(object):
                     if self.device_mesh.get_rank() == 0:
                         print(f"\nProcessing micro batch {idx + 1}/{len(micro_batches)}")
                     # Compute losses using both methods
-                    loss_ref = self._compute_loss(micro_batch.copy())
-                    loss_sp = self._compute_loss_sp(micro_batch.copy())
+                    loss_ref = self._compute_loss_and_backward(micro_batch.copy())
+                    loss_sp = self._compute_loss_and_backward_sp(micro_batch.copy())
                     
                     # Collect losses across all ranks
                     loss_ref_all = loss_ref.clone()
