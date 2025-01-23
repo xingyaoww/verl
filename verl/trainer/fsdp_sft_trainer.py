@@ -156,37 +156,41 @@ class FSDPSFTTrainer(object):
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
 
-        # If doing SP, we need to use the local rank and size
-        if self.config.ulysses_sequence_parallel_size > 1:
-            rank = self.ulysses_device_mesh.get_local_rank('dp')
-            world_size = self.ulysses_device_mesh.size(0)
-            if self.ulysses_device_mesh.get_rank() == 0:
-                print(f'Using SP rank {rank} and size {world_size} for data distribution')
-                print(f'Each SP rank gets different data')
-        else:
-            rank = self.device_mesh.get_rank()
-            world_size = self.device_mesh.size()
-            if self.device_mesh.get_rank() == 0:
-                print(f'Using FSDP rank {rank} and size {world_size} for data distribution')
+        # # If doing SP, we need to use the local rank and size
+        # if self.config.ulysses_sequence_parallel_size > 1:
+        #     rank = self.ulysses_device_mesh.get_local_rank('dp')
+        #     world_size = self.ulysses_device_mesh.size(0)
+        #     if self.ulysses_device_mesh.get_rank() == 0:
+        #         print(f'Using SP rank {rank} and size {world_size} for data distribution')
+        #         print(f'Each SP rank gets different data')
+        # else:
+        rank = self.device_mesh.get_rank()
+        world_size = self.device_mesh.size()
+        if self.device_mesh.get_rank() == 0:
+            print(f'Using FSDP rank {rank} and size {world_size} for data distribution')
 
-        # self.train_sampler = DistributedSampler(self.train_dataset,
-        #                                         shuffle=True,
-        #                                         num_replicas=world_size,
-        #                                         rank=rank,
-        #                                         drop_last=True)
+        self.train_sampler = DistributedSampler(self.train_dataset,
+                                                shuffle=True,
+                                                num_replicas=world_size,
+                                                rank=rank,
+                                                drop_last=True)
         self.train_dataloader = DataLoader(dataset=self.train_dataset,
                                            batch_size=config.data.train_batch_size,
-                                        #    sampler=self.train_sampler,
+                                           sampler=self.train_sampler,
+                                           num_workers=8,
+                                           pin_memory=True,
                                            drop_last=True)
 
-        # self.val_sampler = DistributedSampler(self.val_dataset,
-        #                                       shuffle=True,
-        #                                       num_replicas=world_size,
-        #                                       rank=rank,
-        #                                       drop_last=True)
+        self.val_sampler = DistributedSampler(self.val_dataset,
+                                              shuffle=True,
+                                              num_replicas=world_size,
+                                              rank=rank,
+                                              drop_last=True)
         self.val_dataloader = DataLoader(dataset=self.val_dataset,
                                          batch_size=config.data.micro_batch_size,
-                                        #  sampler=self.val_sampler,
+                                         sampler=self.val_sampler,
+                                         num_workers=8,
+                                         pin_memory=True,
                                          drop_last=True)
 
     def _build_model_optimizer(self):
@@ -517,7 +521,7 @@ class FSDPSFTTrainer(object):
         total_steps = 4
 
         for epoch in range(1):  # Just one epoch for debugging
-            # self.train_sampler.set_epoch(epoch=epoch)
+            self.train_sampler.set_epoch(epoch=epoch)
             for data in self.train_dataloader:
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
                 self.fsdp_model.train()
@@ -574,7 +578,7 @@ class FSDPSFTTrainer(object):
         # TODO (zhangchi.usc1992) add back checkpoint manager. Currently, it blocks when uploading to hdfs. So very slow.
 
         for epoch in range(self.config.trainer.total_epochs):
-            # self.train_sampler.set_epoch(epoch=epoch)
+            self.train_sampler.set_epoch(epoch=epoch)
             for data in self.train_dataloader:
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
                 metric = self.training_step(data)
