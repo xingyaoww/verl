@@ -107,7 +107,7 @@ class SFTDataset(Dataset):
                 print(f'self.responses={self.responses}')
                 raise
         self.responses = self.responses['answer'].tolist()
-        # self.filter_prompt_and_response()
+        self.filter_prompt_and_response()
     
     def filter_prompt_and_response(self):
         """Filter prompt and response based on max length"""
@@ -154,11 +154,11 @@ class SFTDataset(Dataset):
             prompt_chat_str = prompt
             response_chat_str = response
         
-        if item == 0:
-            print('=' * 100)
-            print(f'prompt_chat_str={prompt_chat_str}')
-            print(f'response_chat_str={response_chat_str}')
-            print('=' * 100)
+        # if item == 0:
+        #     print('=' * 100)
+        #     print(f'prompt_chat_str={prompt_chat_str}')
+        #     print(f'response_chat_str={response_chat_str}')
+        #     print('=' * 100)
 
         # tokenize
         prompt_ids_output = tokenizer(prompt_chat_str, return_tensors='pt', add_special_tokens=False)
