@@ -107,32 +107,6 @@ class SFTDataset(Dataset):
                 print(f'self.responses={self.responses}')
                 raise
         self.responses = self.responses['answer'].tolist()
-        self.filter_prompt_and_response()
-    
-    def filter_prompt_and_response(self):
-        """Filter prompt and response based on max length"""
-        new_prompt = []
-        new_response = []
-        print(f"Filtering prompt and response based on max length {self.max_length}")
-        print(f'BEFORE filtering, {len(self.prompts)=}, {len(self.responses)=}')
-
-        # tokenize
-        tokenizer = self.tokenizer
-        for prompt, response in tqdm(zip(self.prompts, self.responses)):
-            prompt_ids_output = tokenizer(prompt, return_tensors='pt', add_special_tokens=False)
-            prompt_ids = prompt_ids_output['input_ids'][0]
-            response_ids_output = tokenizer(response, return_tensors='pt', add_special_tokens=False)
-            response_ids = response_ids_output['input_ids'][0]
-            prompt_length = prompt_ids.shape[0]
-            response_length = response_ids.shape[0]
-
-            if prompt_length + response_length >= self.max_length:
-                continue
-            new_prompt.append(prompt)
-            new_response.append(response)
-        print(f'AFTER filtering based on max length {self.max_length}, {len(new_prompt)=}, {len(new_response)=}')
-        self.prompts = new_prompt
-        self.responses = new_response
 
     def __len__(self):
         return len(self.prompts)
