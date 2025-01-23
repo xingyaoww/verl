@@ -118,8 +118,8 @@ class FSDPSFTTrainer(object):
         if self.device_mesh.get_rank() == 0:
             print(f'Normalize batch size by dp {dp_size}')
 
-        assert self.config.data.train_batch_size % dp_size == 0
-        assert self.config.data.micro_batch_size % dp_size == 0
+        assert self.config.data.train_batch_size % dp_size == 0, f"Global batch size {self.config.data.train_batch_size} is not divisible by dp size {dp_size}"
+        assert self.config.data.micro_batch_size % dp_size == 0, f"Micro batch size {self.config.data.micro_batch_size} is not divisible by dp size {dp_size}"
 
         self.config.data.train_batch_size //= dp_size
         self.config.data.micro_batch_size //= dp_size
@@ -361,7 +361,10 @@ class FSDPSFTTrainer(object):
                 logits_rmpad = output.logits.squeeze(0)  # ((total_nnz / sp) + pad, vocab_size)
 
                 # Compute loss
-                loss_fct = nn.CrossEntropyLoss(reduction='none')
+                loss_fct = nn.CrossEntropyLoss(
+                    reduction='none',
+                    label_smoothing=self.config.optim.label_smoothing
+                )
                 # They indeed match!
                 # basically computing the loss on the current slice of sequence/labels
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
