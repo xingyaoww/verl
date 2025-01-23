@@ -29,6 +29,7 @@ import torch
 import torch.distributed
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, CPUOffload
+from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, AutoConfig
 from verl.utils.torch_functional import get_cosine_schedule_with_warmup
 from tensordict import TensorDict
@@ -289,19 +290,19 @@ class FSDPSFTTrainer(object):
 
         log_gpu_memory_usage('After initialize optimizer', logger=logger)
 
-        steps_per_epoch = len(self.train_dataloader)
-        total_steps = steps_per_epoch * self.config.trainer.total_epochs
+        self.steps_per_epoch = len(self.train_dataloader)
+        self.total_steps = self.steps_per_epoch * self.config.trainer.total_epochs
 
         if self.device_mesh.get_rank() == 0:
             print(
-                f'Number of steps/epoch {steps_per_epoch}, number of epochs {self.config.trainer.total_epochs}, total number of steps {total_steps}'
+                f'Number of steps/epoch {self.steps_per_epoch}, number of epochs {self.config.trainer.total_epochs}, total number of steps {self.total_steps}'
             )
 
-        num_warmup_steps = int(total_steps * self.config.optim.warmup_steps_ratio)
+        num_warmup_steps = int(self.total_steps * self.config.optim.warmup_steps_ratio)
 
         self.lr_scheduler = get_cosine_schedule_with_warmup(optimizer=self.optimizer,
                                                             num_warmup_steps=num_warmup_steps,
-                                                            num_training_steps=total_steps)
+                                                            num_training_steps=self.total_steps)
 
     def _compute_loss_and_backward(self, batch, do_backward=True):
         loss_mask = batch.pop('loss_mask')[:, :-1].reshape(-1).cuda()
@@ -561,7 +562,7 @@ class FSDPSFTTrainer(object):
 
         for epoch in range(self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
-            for data in self.train_dataloader:
+            for data in tqdm(self.train_dataloader, total=self.steps_per_epoch, desc=f"Epoch {epoch+1}/{self.config.trainer.total_epochs}"):
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
                 metric = self.training_step(data)
                 if rank == 0:
