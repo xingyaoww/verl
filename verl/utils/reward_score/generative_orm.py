@@ -16,17 +16,17 @@ import re
 import random
 
 
+import re
+import random
+
 def extract_solution(solution_str, method='strict'):
     pattern = r'<reward>(.*?)</reward>'
-    # Find all matches to count total occurrences
-    all_matches = re.findall(pattern, solution_str, re.DOTALL)
-    count = len(all_matches)
-    
+
     # Get first match content
     first_match = re.search(pattern, solution_str, re.DOTALL)
     content = first_match.group(1).strip() if first_match else None
     
-    return content, count
+    return content
 
 
 def compute_score(solution_str: str, ground_truth: bool, method='strict', format_score=0., score=1.):
@@ -40,7 +40,9 @@ def compute_score(solution_str: str, ground_truth: bool, method='strict', format
         score: the score for the correct answer
     """
     do_print = random.randint(1, 64) == 1
-    reward, count = extract_solution(solution_str=solution_str, method=method)
+    SEP = "Please first provide your evaluation of the agent's overall problem-solving approach and effectiveness, then provide the reward value (integer between 0 and 100, inclusive) enclosed in <reward>...</reward> tags."
+    solution_str = solution_str.split(SEP)[-1]
+    reward = extract_solution(solution_str=solution_str, method=method)
 
     if do_print:
         print(f"--------------------------------")
@@ -56,9 +58,9 @@ def compute_score(solution_str: str, ground_truth: bool, method='strict', format
     # Try convert reward to int
     try:
         reward = int(reward)
-    except ValueError:
+    except ValueError as e:
         if do_print:
-            print(f"Failed to convert reward to int: {reward}. Reward: 0.1 (format score)")
+            print(f"Failed to convert reward to int (parsed: {reward}): {e}. Reward: 0.1 (format score)")
         return 0.1  # format score
 
     # Try assert reward is in [0, 100]
