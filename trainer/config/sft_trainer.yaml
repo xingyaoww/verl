@@ -1,0 +1,43 @@
+data:
+  train_files: null
+  val_files: null
+  train_batch_size: 1
+  val_batch_size: 1
+  micro_batch_size: 1
+  prompt_key: prompt
+  response_key: response
+  max_length: 1024
+  truncation: error
+  balance_dp_token: False
+  chat_template: null
+model:
+  partial_pretrain: ~/models/gemma-1.1-7b-it
+  fsdp_config:
+    fsdp_transformer_layer_cls_to_wrap: null
+    min_num_params: 0
+    use_orig_params: False
+    limit_all_gathers: True
+    sync_module_states: True
+    forward_prefetch: True
+    backward_prefetch: True
+    use_sharded_optimizer_state: True
+  # PEFT parameters
+  lora_rank: null  # if not null, will use LoRA
+  lora_alpha: null  # if not null, will use LoRA
+  target_modules: null  # if not null, will use LoRA
+
+optim:
+  lr: 2e-5
+  weight_decay: 0.01
+  warmup_steps_ratio: 0.1
+  clip_grad: 1.0
+
+trainer:
+  default_local_dir: /tmp/sft_model
+  default_hdfs_dir: null
+  project_name: sft
+  experiment_name: sft
+  total_epochs: 1
+  logger: ['console']
+  save_interval: 1000
+  val_interval: 100
