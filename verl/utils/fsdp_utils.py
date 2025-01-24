@@ -45,9 +45,7 @@ def get_init_weight_context_manager(use_meta_tensor=True):
 
 # Copyright 2020-present the HuggingFace Inc. team.
 # Adapted from https://github.com/huggingface/transformers/src/transformers/trainer.py
-# and https://github.com/huggingface/peft/blob/63ae263644b9a2527dccd1970bd934e317a6173e/src/peft/utils/other.py#L508C5-L508C26
-def get_fsdp_wrap_policy(module, config=None):
-    # should work for both transformers lib models and peft lib models
+def get_fsdp_wrap_policy(module, config=None, is_lora=False):
     if config is None:
         config = {}
 
@@ -64,8 +62,8 @@ def get_fsdp_wrap_policy(module, config=None):
     
     from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy, transformer_auto_wrap_policy
     
-    # Only add lambda policy for LoRA modules if LoRA is enabled (indicated by lora_rank > 0)
-    if hasattr(module, "peft_config") and getattr(module.peft_config.get("default", {}), "r", 0) > 0:
+    # Add lambda policy for LoRA modules if is_lora is True
+    if is_lora:
         def lambda_policy_fn(module):
             if (
                 len(list(module.named_children())) == 0
