@@ -46,6 +46,13 @@ def get_init_weight_context_manager(use_meta_tensor=True):
 # Copyright 2020-present the HuggingFace Inc. team.
 # Adapted from https://github.com/huggingface/transformers/src/transformers/trainer.py
 def get_fsdp_wrap_policy(module, config=None, is_lora=False):
+    """Get FSDP wrap policy for the module.
+    
+    Args:
+        module: The module to get wrap policy for
+        config: Configuration for wrap policy
+        is_lora: Whether to enable lambda policy for LoRA modules
+    """
     if config is None:
         config = {}
 
