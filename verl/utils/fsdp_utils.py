@@ -63,16 +63,19 @@ def get_fsdp_wrap_policy(module, config=None):
     policies = []
     
     from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy, transformer_auto_wrap_policy
-    def lambda_policy_fn(module):
-        if (
-            len(list(module.named_children())) == 0
-            and getattr(module, "weight", None) is not None
-            and module.weight.requires_grad
-        ):
-            return True
-        return False
-    lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
-    policies.append(lambda_policy)
+    
+    # Only add lambda policy for LoRA modules if LoRA is enabled (indicated by lora_rank > 0)
+    if hasattr(module, "peft_config") and getattr(module.peft_config.get("default", {}), "r", 0) > 0:
+        def lambda_policy_fn(module):
+            if (
+                len(list(module.named_children())) == 0
+                and getattr(module, "weight", None) is not None
+                and module.weight.requires_grad
+            ):
+                return True
+            return False
+        lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
+        policies.append(lambda_policy)
 
     if min_num_params > 0:
         size_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=min_num_params)
