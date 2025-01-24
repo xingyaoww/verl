@@ -17,6 +17,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -32,6 +33,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
+from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 WorkerType = Type[Worker]
 
@@ -111,21 +113,33 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
-def compute_advantage(data: DataProto, gamma, lam, adv_estimator):
-    values = data.batch['values']
-    responses = data.batch['responses']
-    response_length = responses.size(1)
-    attention_mask = data.batch['attention_mask']
-    response_mask = attention_mask[:, -response_length:]
-    token_level_rewards = data.batch['token_level_rewards']
-
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+    # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == 'gae':
+        values = data.batch['values']
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        token_level_rewards = data.batch['token_level_rewards']
         advantages, returns = core_algos.compute_gae_advantage_return(token_level_rewards=token_level_rewards,
                                                                       values=values,
                                                                       eos_mask=response_mask,
                                                                       gamma=gamma,
                                                                       lam=lam)
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
+    elif adv_estimator == 'grpo':
+        token_level_rewards = data.batch['token_level_rewards']
+        index = data.non_tensor_batch['uid']
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=token_level_rewards,
+                                                                        eos_mask=response_mask,
+                                                                        index=index)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     else:
@@ -155,49 +169,90 @@ def _compute_response_info(batch):
     )
 
 
-def compute_data_metrics(batch):
+def compute_data_metrics(batch, use_critic=True):
     # TODO: add response length
     sequence_score = batch.batch['token_level_scores'].sum(-1)
     sequence_reward = batch.batch['token_level_rewards'].sum(-1)
 
     advantages = batch.batch['advantages']
     returns = batch.batch['returns']
-    values = batch.batch['values']
+
+    max_response_length = batch.batch['responses'].shape[-1]
+
+    prompt_mask = batch.batch['attention_mask'][:, :-max_response_length].bool()
+    response_mask = batch.batch['attention_mask'][:, -max_response_length:].bool()
+
+    max_prompt_length = prompt_mask.size(-1)
 
     response_info = _compute_response_info(batch)
-    response_mask = response_info['response_mask']
     prompt_length = response_info['prompt_length']
     response_length = response_info['response_length']
 
+    valid_adv = torch.masked_select(advantages, response_mask)
+    valid_returns = torch.masked_select(returns, response_mask)
+
+    if use_critic:
+        values = batch.batch['values']
+        valid_values = torch.masked_select(values, response_mask)
+        return_diff_var = torch.var(valid_returns - valid_values)
+        return_var = torch.var(valid_returns)
+
     metrics = {
         # score
-        'critic/score/mean': torch.mean(sequence_score).detach().item(),
-        'critic/score/max': torch.max(sequence_score).detach().item(),
-        'critic/score/min': torch.min(sequence_score).detach().item(),
+        'critic/score/mean':
+            torch.mean(sequence_score).detach().item(),
+        'critic/score/max':
+            torch.max(sequence_score).detach().item(),
+        'critic/score/min':
+            torch.min(sequence_score).detach().item(),
         # reward
-        'critic/rewards/mean': torch.mean(sequence_reward).detach().item(),
-        'critic/rewards/max': torch.max(sequence_reward).detach().item(),
-        'critic/rewards/min': torch.min(sequence_reward).detach().item(),
+        'critic/rewards/mean':
+            torch.mean(sequence_reward).detach().item(),
+        'critic/rewards/max':
+            torch.max(sequence_reward).detach().item(),
+        'critic/rewards/min':
+            torch.min(sequence_reward).detach().item(),
         # adv
-        'critic/advantages/mean': masked_mean(advantages, response_mask).detach().item(),
-        'critic/advantages/max': torch.max(advantages[response_mask.bool()]).detach().item(),
-        'critic/advantages/min': torch.min(advantages[response_mask.bool()]).detach().item(),
+        'critic/advantages/mean':
+            torch.mean(valid_adv).detach().item(),
+        'critic/advantages/max':
+            torch.max(valid_adv).detach().item(),
+        'critic/advantages/min':
+            torch.min(valid_adv).detach().item(),
         # returns
-        'critic/returns/mean': masked_mean(returns, response_mask).detach().item(),
-        'critic/returns/max': torch.max(returns[response_mask.bool()]).detach().item(),
-        'critic/returns/min': torch.min(returns[response_mask.bool()]).detach().item(),
-        # values
-        'critic/values/mean': masked_mean(values, response_mask).detach().item(),
-        'critic/values/max': torch.max(values[response_mask.bool()]).detach().item(),
-        'critic/values/min': torch.min(values[response_mask.bool()]).detach().item(),
+        'critic/returns/mean':
+            torch.mean(valid_returns).detach().item(),
+        'critic/returns/max':
+            torch.max(valid_returns).detach().item(),
+        'critic/returns/min':
+            torch.min(valid_returns).detach().item(),
+        **({
+            # values
+            'critic/values/mean': torch.mean(valid_values).detach().item(),
+            'critic/values/max': torch.max(valid_values).detach().item(),
+            'critic/values/min': torch.min(valid_values).detach().item(),
+            # vf explained var
+            'critic/vf_explained_var': (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
+        } if use_critic else {}),
+
         # response length
-        'response_length/mean': torch.mean(response_length).detach().item(),
-        'response_length/max': torch.max(response_length).detach().item(),
-        'response_length/min': torch.min(response_length).detach().item(),
+        'response_length/mean':
+            torch.mean(response_length).detach().item(),
+        'response_length/max':
+            torch.max(response_length).detach().item(),
+        'response_length/min':
+            torch.min(response_length).detach().item(),
+        'response_length/clip_ratio':
+            torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
         # prompt length
-        'prompt_length/mean': torch.mean(prompt_length).detach().item(),
-        'prompt_length/max': torch.max(prompt_length).detach().item(),
-        'prompt_length/min': torch.min(prompt_length).detach().item(),
+        'prompt_length/mean':
+            torch.mean(prompt_length).detach().item(),
+        'prompt_length/max':
+            torch.max(prompt_length).detach().item(),
+        'prompt_length/min':
+            torch.min(prompt_length).detach().item(),
+        'prompt_length/clip_ratio':
+            torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
     return metrics
 
@@ -217,10 +272,10 @@ def compute_timing_metrics(batch, timing_raw):
 
     return {
         **{
-            f'timing/{name}': value for name, value in timing_raw.items()
+            f'timing_s/{name}': value for name, value in timing_raw.items()
         },
         **{
-            f'timing_per_token/{name}': timing_raw[name] / num_tokens_of_section[name] for name in set(num_tokens_of_section.keys(
+            f'timing_per_token_ms/{name}': timing_raw[name] * 1000 / num_tokens_of_section[name] for name in set(num_tokens_of_section.keys(
             )) & set(timing_raw.keys())
         },
     }
@@ -382,7 +437,7 @@ class RayPPOTrainer(object):
 
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
-            metric_dict[f'test_score/{data_source}'] = np.mean(rewards)
+            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
 
         return metric_dict
 
@@ -408,8 +463,9 @@ class RayPPOTrainer(object):
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
             self.use_critic = True
+        elif self.config.algorithm.adv_estimator == 'grpo':
+            self.use_critic = False
         else:
-            # support GRPO and ReMax
             raise NotImplementedError
 
         # create reference policy if needed
@@ -457,6 +513,37 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
 
+    def _save_checkpoint(self):
+        actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
+                                        f'global_step_{self.global_steps}')
+        actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
+            self.config.trainer.default_hdfs_dir, 'actor')
+        self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path)
+
+        if self.use_critic:
+            critic_local_path = os.path.join(self.config.trainer.default_local_dir, 'critic',
+                                             f'global_step_{self.global_steps}')
+            critic_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
+                self.config.trainer.default_hdfs_dir, 'critic')
+            self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
+
+    def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
+        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+        attention_mask = batch.batch['attention_mask']
+        batch_size = attention_mask.shape[0]
+        global_seqlen_lst = batch.batch['attention_mask'].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
+        world_size = self.actor_rollout_wg.world_size
+        global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst,
+                                                              k_partitions=world_size,
+                                                              equal_size=True)
+        # reorder based on index. The data will be automatically equally partitioned by dispatch function
+        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+        batch.reorder(global_idx)
+        global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst,
+                                                    partitions=global_partition_lst,
+                                                    prefix=logging_prefix)
+        metrics.update(global_balance_stats)
+
     def fit(self):
         """
         The training loop of PPO.
@@ -482,103 +569,112 @@ class RayPPOTrainer(object):
             if self.config.trainer.get('val_only', False):
                 return
 
+        # we start from step 1
+        self.global_steps += 1
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
-                # batch = batch.to('cuda')
 
                 # pop those keys for generation
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
 
-                # generate a batch
-                with _timer('gen', timing_raw):
-                    gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                with _timer('step', timing_raw):
+                    # generate a batch
+                    with _timer('gen', timing_raw):
+                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
-                # repeat to align with repeated responses in rollout
-                batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                batch = batch.union(gen_batch_output)
+                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                                                             dtype=object)
+                    # repeat to align with repeated responses in rollout
+                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    batch = batch.union(gen_batch_output)
 
-                if self.use_reference_policy:
-                    # compute reference log_prob
-                    with _timer('ref', timing_raw):
-                        ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                        batch = batch.union(ref_log_prob)
+                    # balance the number of valid tokens on each dp rank.
+                    # Note that this breaks the order of data inside the batch.
+                    # Please take care when you implement group based adv computation such as GRPO and rloo
+                    self._balance_batch(batch, metrics=metrics)
 
-                # compute values
-                with _timer('values', timing_raw):
-                    values = self.critic_wg.compute_values(batch)
-                    batch = batch.union(values)
+                    # compute global_valid tokens
+                    batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
-                with _timer('adv', timing_raw):
-                    # compute scores. Support both model and function-based.
-                    # We first compute the scores using reward model. Then, we call reward_fn to combine
-                    # the results from reward model and rule-based results.
-                    if self.use_rm:
-                        # we first compute reward model score
-                        reward_tensor = self.rm_wg.compute_rm_score(batch)
-                        batch = batch.union(reward_tensor)
+                    if self.use_reference_policy:
+                        # compute reference log_prob
+                        with _timer('ref', timing_raw):
+                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            batch = batch.union(ref_log_prob)
 
-                    # we combine with rule-based rm
-                    reward_tensor = self.reward_fn(batch)
-                    batch.batch['token_level_scores'] = reward_tensor
+                    # compute values
+                    if self.use_critic:
+                        with _timer('values', timing_raw):
+                            values = self.critic_wg.compute_values(batch)
+                            batch = batch.union(values)
 
-                    # compute rewards. apply_kl_penalty if available
-                    batch, kl_metrics = apply_kl_penalty(batch,
-                                                         kl_ctrl=self.kl_ctrl,
-                                                         kl_penalty=self.config.algorithm.kl_penalty)
-                    metrics.update(kl_metrics)
+                    with _timer('adv', timing_raw):
+                        # compute scores. Support both model and function-based.
+                        # We first compute the scores using reward model. Then, we call reward_fn to combine
+                        # the results from reward model and rule-based results.
+                        if self.use_rm:
+                            # we first compute reward model score
+                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            batch = batch.union(reward_tensor)
 
-                    # compute advantages, executed on the driver process
-                    batch = compute_advantage(batch,
-                                              self.config.algorithm.gamma,
-                                              self.config.algorithm.lam,
-                                              adv_estimator=self.config.algorithm.adv_estimator)
+                        # we combine with rule-based rm
+                        reward_tensor = self.reward_fn(batch)
+                        batch.batch['token_level_scores'] = reward_tensor
 
-                # update critic
-                if self.use_critic:
-                    with _timer('update_critic', timing_raw):
-                        critic_output = self.critic_wg.update_critic(batch)
-                    critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
-                    metrics.update(critic_output_metrics)
+                        # compute rewards. apply_kl_penalty if available
+                        if not self.config.actor_rollout_ref.actor.use_kl_loss:
+                            batch, kl_metrics = apply_kl_penalty(batch,
+                                                                 kl_ctrl=self.kl_ctrl,
+                                                                 kl_penalty=self.config.algorithm.kl_penalty)
+                            metrics.update(kl_metrics)
+                        else:
+                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
-                # implement critic warmup
-                if self.config.trainer.critic_warmup <= self.global_steps:
-                    # update actor
-                    with _timer('update_actor', timing_raw):
-                        actor_output = self.actor_rollout_wg.update_actor(batch)
-                    actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                    metrics.update(actor_output_metrics)
+                        # compute advantages, executed on the driver process
+                        batch = compute_advantage(batch,
+                                                  adv_estimator=self.config.algorithm.adv_estimator,
+                                                  gamma=self.config.algorithm.gamma,
+                                                  lam=self.config.algorithm.lam,
+                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
 
-                # validate
-                if self.val_reward_fn is not None and (self.global_steps + 1) % self.config.trainer.test_freq == 0:
-                    with _timer('testing', timing_raw):
-                        val_metrics: dict = self._validate()
-                        val_metrics = {f'val/{key}': val for key, val in val_metrics.items()}
-                    metrics.update(val_metrics)
+                    # update critic
+                    if self.use_critic:
+                        with _timer('update_critic', timing_raw):
+                            critic_output = self.critic_wg.update_critic(batch)
+                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                        metrics.update(critic_output_metrics)
+
+                    # implement critic warmup
+                    if self.config.trainer.critic_warmup <= self.global_steps:
+                        # update actor
+                        with _timer('update_actor', timing_raw):
+                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                        metrics.update(actor_output_metrics)
+
+                    # validate
+                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
+                        self.global_steps % self.config.trainer.test_freq == 0:
+                        with _timer('testing', timing_raw):
+                            val_metrics: dict = self._validate()
+                        metrics.update(val_metrics)
+
+                    if self.config.trainer.save_freq > 0 and \
+                            self.global_steps % self.config.trainer.save_freq == 0:
+                        with _timer('save_checkpoint', timing_raw):
+                            self._save_checkpoint()
 
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch))
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
-
-                if self.config.trainer.save_freq > 0 and (self.global_steps + 1) % self.config.trainer.save_freq == 0:
-                    actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
-                                                    f'global_step_{self.global_steps}')
-                    actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
-                        self.config.trainer.default_hdfs_dir, 'actor')
-                    self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path)
-
-                    if self.use_critic:
-                        critic_local_path = os.path.join(self.config.trainer.default_local_dir, 'critic',
-                                                         f'global_step_{self.global_steps}')
-                        critic_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
-                            self.config.trainer.default_hdfs_dir, 'critic')
-                        self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
 
                 self.global_steps += 1
 

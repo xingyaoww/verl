@@ -35,6 +35,10 @@ from verl.utils.fsdp_utils import offload_fsdp_optimizer, offload_fsdp_param_and
     load_fsdp_param_and_grad
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.flops_counter import FlopsCounter
+from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+
+from codetiming import Timer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
@@ -53,11 +57,22 @@ class ActorRolloutRefWorker(Worker):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl")
 
-        # build device mesh
+        # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
         from torch.distributed.device_mesh import init_device_mesh
         # TODO(sgm): support FSDP hybrid shard for larger model
         self.device_mesh = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
+
+        # build device mesh for Ulysses Sequence Parallel
+        self.ulysses_device_mesh = None
+        self.ulysses_sequence_parallel_size = self.config.actor.get('ulysses_sequence_parallel_size', 1)
+        dp = world_size // self.ulysses_sequence_parallel_size
+        if self.ulysses_sequence_parallel_size > 1:
+            self.ulysses_device_mesh = init_device_mesh('cuda',
+                                                        mesh_shape=(dp, self.ulysses_sequence_parallel_size),
+                                                        mesh_dim_names=['dp', 'sp'])
+
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
         self.role = role
         assert self.role in ['actor', 'rollout', 'ref', 'actor_rollout', 'actor_rollout_ref']
@@ -79,15 +94,18 @@ class ActorRolloutRefWorker(Worker):
 
         # normalize config
         if self._is_actor:
-            self.config.actor.ppo_mini_batch_size //= self.device_mesh.shape[0]
-            self.config.actor.ppo_micro_batch_size //= self.device_mesh.shape[0]
+            self.config.actor.ppo_mini_batch_size //= (self.device_mesh.shape[0] // self.ulysses_sequence_parallel_size)
+            self.config.actor.ppo_micro_batch_size //= (self.device_mesh.shape[0] //
+                                                        self.ulysses_sequence_parallel_size)
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
             self.config.actor.ppo_micro_batch_size *= self.config.rollout.n
         if self._is_rollout:
-            self.config.rollout.log_prob_micro_batch_size //= self.device_mesh.shape[0]
+            self.config.rollout.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
+                                                               self.ulysses_sequence_parallel_size)
             self.config.rollout.log_prob_micro_batch_size *= self.config.rollout.n
         if self._is_ref:
-            self.config.ref.log_prob_micro_batch_size //= self.device_mesh.shape[0]
+            self.config.ref.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
+                                                           self.ulysses_sequence_parallel_size)
             self.config.ref.log_prob_micro_batch_size *= self.config.rollout.n
 
     def _build_model_optimizer(self,
@@ -124,6 +142,10 @@ class ActorRolloutRefWorker(Worker):
             from verl.models.registry import check_model_support_rmpad
             check_model_support_rmpad(actor_model_config.model_type)
 
+        if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
+            from verl.models.transformers.monkey_patch import apply_monkey_patch
+            apply_monkey_patch(actor_model_config, verbose=True)
+
         override_config_kwargs = {
             'bos_token_id': self.tokenizer.bos_token_id,
             'eos_token_id': self.tokenizer.eos_token_id,
@@ -148,7 +170,7 @@ class ActorRolloutRefWorker(Worker):
             actor_module.to(torch_dtype)
 
             if enable_gradient_checkpointing:
-                actor_module.gradient_checkpointing_enable()
+                actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
         torch.distributed.barrier()
 
         if self.rank == 0:
@@ -196,7 +218,8 @@ class ActorRolloutRefWorker(Worker):
             sharding_strategy=sharding_strategy,  # zero3
             mixed_precision=mixed_precision,
             sync_module_states=True,
-            device_mesh=self.device_mesh)
+            device_mesh=self.device_mesh,
+            forward_prefetch=False)
 
         log_gpu_memory_usage('After Actor FSDP init', logger=logger)
 
@@ -225,11 +248,18 @@ class ActorRolloutRefWorker(Worker):
         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
 
     def _build_rollout(self):
+        from torch.distributed.device_mesh import init_device_mesh
+        # TODO(sgm): support FSDP hybrid shard for larger model
+        infer_tp = self.config.rollout.tensor_model_parallel_size
+        dp = self.world_size // infer_tp
+        assert self.world_size % infer_tp == 0, f'rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}'
+        rollout_device_mesh = init_device_mesh('cuda', mesh_shape=(dp, infer_tp), mesh_dim_names=['dp', 'infer_tp'])
+
         if self.config.rollout.name == 'hf':
             from verl.workers.rollout import HFRollout
             from verl.workers.sharding_manager import BaseShardingManager
             rollout = HFRollout(module=self.actor_module_fsdp, config=self.config.rollout)
-            sharding_manager = BaseShardingManager()
+            rollout_sharding_manager = BaseShardingManager()
             # TODO: a sharding manager that do nothing?
         elif self.config.rollout.name == 'vllm':
             from verl.workers.rollout.vllm_rollout import vLLMRollout
@@ -242,13 +272,14 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage('After building vllm rollout', logger=None)
             if torch.distributed.get_world_size() == 1:
                 self.config.rollout.load_format = 'dummy_hf'
-            sharding_manager = FSDPVLLMShardingManager(module=self.actor_module_fsdp,
-                                                       inference_engine=rollout.inference_engine,
-                                                       model_config=self.actor_model_config,
-                                                       full_params='hf' in self.config.rollout.load_format)
+            rollout_sharding_manager = FSDPVLLMShardingManager(module=self.actor_module_fsdp,
+                                                               inference_engine=rollout.inference_engine,
+                                                               model_config=self.actor_model_config,
+                                                               full_params='hf' in self.config.rollout.load_format,
+                                                               device_mesh=rollout_device_mesh)
             log_gpu_memory_usage('After building sharding manager', logger=None)
 
-        return rollout, sharding_manager
+        return rollout, rollout_sharding_manager
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -298,7 +329,7 @@ class ActorRolloutRefWorker(Worker):
                                               actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout:
-            self.rollout, self.sharding_manager = self._build_rollout()
+            self.rollout, self.rollout_sharding_manager = self._build_rollout()
 
         if self._is_ref:
             self.ref_module_fsdp = self._build_model_optimizer(model_path=self.config.model.path,
@@ -315,6 +346,9 @@ class ActorRolloutRefWorker(Worker):
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+
+        if self._is_actor:
+            self.flops_counter = FlopsCounter(self.actor_model_config)
 
         torch.cuda.empty_cache()
 
@@ -334,17 +368,27 @@ class ActorRolloutRefWorker(Worker):
 
         log_gpu_memory_usage('Before update policy', logger=logger)
 
-        metrics = self.actor.update_policy(data=data)
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            # perform training
+            with Timer(name='update_policy', logger=None) as timer:
+                metrics = self.actor.update_policy(data=data)
+            delta_time = timer.last
+            global_num_tokens = data.meta_info['global_token_num']
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
 
-        self.actor_lr_scheduler.step()
-        lr = self.actor_lr_scheduler.get_last_lr()[0]
-        metrics['actor/lr'] = lr
+            self.actor_lr_scheduler.step()
+            lr = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics['actor/lr'] = lr
 
-        log_gpu_memory_usage('After update policy', logger=logger)
+            log_gpu_memory_usage('After update policy', logger=logger)
 
-        # TODO: here, we should return all metrics
-        output = DataProto(meta_info={'metrics': metrics})
-        output = output.to('cpu')
+            # TODO: here, we should return all metrics
+            output = DataProto(meta_info={'metrics': metrics})
+
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            output = output.to('cpu')
 
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
@@ -368,22 +412,28 @@ class ActorRolloutRefWorker(Worker):
         prompts.batch = prompts.batch.cuda()
         meta_info = {'eos_token_id': self.tokenizer.eos_token_id, 'pad_token_id': self.tokenizer.pad_token_id}
         prompts.meta_info.update(meta_info)
-        with self.sharding_manager:
-            log_gpu_memory_usage('After entering sharding manager', logger=logger)
+        with self.rollout_sharding_manager:
+            log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
 
-            prompts = self.sharding_manager.preprocess_data(prompts)
+            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
             output = self.rollout.generate_sequences(prompts=prompts)
 
             log_gpu_memory_usage('After rollout generation', logger=logger)
 
-            output = self.sharding_manager.postprocess_data(output)
+            output = self.rollout_sharding_manager.postprocess_data(output)
 
         if self._is_actor and recompute_log_prob:
             # we should always recompute old_log_probs when it is HybridEngine
             output.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size
+            output.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
+            output.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
             output.meta_info['temperature'] = self.config.rollout.temperature
-            old_log_probs = self.actor.compute_log_prob(data=output)
-            output.batch['old_log_probs'] = old_log_probs
+            # perform recompute log_prob
+            with self.ulysses_sharding_manager:
+                output = self.ulysses_sharding_manager.preprocess_data(output)
+                old_log_probs = self.actor.compute_log_prob(data=output)
+                output.batch['old_log_probs'] = old_log_probs
+                output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to('cpu')
 
@@ -409,8 +459,13 @@ class ActorRolloutRefWorker(Worker):
         micro_batch_size = self.config.ref.log_prob_micro_batch_size
         data.meta_info['micro_batch_size'] = micro_batch_size
         data.meta_info['temperature'] = self.config.rollout.temperature
-        output = self.ref_policy.compute_log_prob(data=data)
-        output = DataProto.from_dict(tensors={'ref_log_prob': output})
+        data.meta_info['max_token_len'] = self.config.ref.log_prob_max_token_len_per_gpu
+        data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            output = self.ref_policy.compute_log_prob(data=data)
+            output = DataProto.from_dict(tensors={'ref_log_prob': output})
+            output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to('cpu')
 
@@ -457,14 +512,30 @@ class CriticWorker(Worker):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl")
         self.config = config
+
+        # build device mesh for Ulysses Sequence Parallel
+        world_size = torch.distributed.get_world_size()
+        from torch.distributed.device_mesh import init_device_mesh
+        self.ulysses_device_mesh = None
+        self.ulysses_sequence_parallel_size = self.config.get('ulysses_sequence_parallel_size', 1)
+        dp = world_size // self.ulysses_sequence_parallel_size
+        if self.ulysses_sequence_parallel_size > 1:
+            self.ulysses_device_mesh = init_device_mesh('cuda',
+                                                        mesh_shape=(dp, self.ulysses_sequence_parallel_size),
+                                                        mesh_dim_names=['dp', 'sp'])
+
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+
+        # set FSDP offload params
         self._is_offload_param = self.config.model.fsdp_config.param_offload
         self._is_offload_grad = self.config.model.fsdp_config.grad_offload
         self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
 
         # normalize config
-        self.config.ppo_mini_batch_size //= torch.distributed.get_world_size()
-        self.config.ppo_micro_batch_size //= torch.distributed.get_world_size()
-        self.config.forward_micro_batch_size //= torch.distributed.get_world_size()
+        self.config.ppo_mini_batch_size //= (torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size)
+        self.config.ppo_micro_batch_size //= (torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size)
+        self.config.forward_micro_batch_size //= (torch.distributed.get_world_size() //
+                                                  self.ulysses_sequence_parallel_size)
 
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary
@@ -506,6 +577,10 @@ class CriticWorker(Worker):
             from verl.models.registry import check_model_support_rmpad
             check_model_support_rmpad(critic_model_config.model_type)
 
+        if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
+            from verl.models.transformers.monkey_patch import apply_monkey_patch
+            apply_monkey_patch(critic_model_config, verbose=True)
+
         init_context = get_init_weight_context_manager()
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -521,9 +596,11 @@ class CriticWorker(Worker):
             critic_module.to(torch_dtype)
 
             if config.model.get('enable_gradient_checkpointing', False):
-                critic_module.gradient_checkpointing_enable()
+                critic_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
         if self.rank == 0:
             print_model_size(critic_module)
+
+        self.critic_model_config = critic_model_config
 
         fsdp_config = self.config.model.fsdp_config
         mixed_precision_config = fsdp_config.get('mixed_precision', None)
@@ -549,7 +626,8 @@ class CriticWorker(Worker):
                              device_id=torch.cuda.current_device(),
                              sharding_strategy=ShardingStrategy.FULL_SHARD,
                              mixed_precision=mixed_precision,
-                             sync_module_states=True)
+                             sync_module_states=True,
+                             forward_prefetch=False)
 
         log_gpu_memory_usage('After critic FSDP', logger=None)
 
@@ -587,6 +665,9 @@ class CriticWorker(Worker):
         self.critic = DataParallelPPOCritic(config=self.config,
                                             critic_module=self.critic_module,
                                             critic_optimizer=self.critic_optimizer)
+
+        self.flops_counter = FlopsCounter(self.critic_model_config)
+
         torch.cuda.empty_cache()
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -599,8 +680,15 @@ class CriticWorker(Worker):
                                      load_grad=self._is_offload_grad)
         micro_batch_size = self.config.forward_micro_batch_size
         data.meta_info['micro_batch_size'] = micro_batch_size
-        values = self.critic.compute_values(data=data)
-        output = DataProto.from_dict(tensors={'values': values})
+        data.meta_info['max_token_len'] = self.config.forward_max_token_len_per_gpu
+        data.meta_info['use_dynamic_bsz'] = self.config.use_dynamic_bsz
+        # perform forward computation
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            values = self.critic.compute_values(data=data)
+            output = DataProto.from_dict(tensors={'values': values})
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+
         output = output.to('cpu')
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
@@ -616,13 +704,26 @@ class CriticWorker(Worker):
                                      load_grad=self._is_offload_grad)
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=torch.cuda.current_device())
-        metrics = self.critic.update_critic(data=data)
 
-        self.critic_lr_scheduler.step()
-        lr = self.critic_lr_scheduler.get_last_lr()[0]
-        metrics['critic/lr'] = lr
+        # perform forward computation
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
 
-        output = DataProto(batch=None, meta_info={'metrics': metrics})
+            with Timer(name='update_critic', logger=None) as timer:
+                metrics = self.critic.update_critic(data=data)
+            delta_time = timer.last
+
+            global_num_tokens = data.meta_info['global_token_num']
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics['mfu/critic'] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
+
+            self.critic_lr_scheduler.step()
+            lr = self.critic_lr_scheduler.get_last_lr()[0]
+            metrics['critic/lr'] = lr
+
+            output = DataProto(batch=None, meta_info={'metrics': metrics})
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
         if self._is_offload_optimizer:
@@ -672,6 +773,20 @@ class RewardModelWorker(Worker):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl")
         self.config = config
+
+        # build device mesh for Ulysses Sequence Parallel
+        world_size = torch.distributed.get_world_size()
+        from torch.distributed.device_mesh import init_device_mesh
+        self.ulysses_device_mesh = None
+        self.ulysses_sequence_parallel_size = self.config.get('ulysses_sequence_parallel_size', 1)
+        dp = world_size // self.ulysses_sequence_parallel_size
+        if self.ulysses_sequence_parallel_size > 1:
+            self.ulysses_device_mesh = init_device_mesh('cuda',
+                                                        mesh_shape=(dp, self.ulysses_sequence_parallel_size),
+                                                        mesh_dim_names=['dp', 'sp'])
+
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+
         self.use_remove_padding = self.config.model.get('use_remove_padding', False)
         self.config.micro_batch_size //= torch.distributed.get_world_size()
 
@@ -695,6 +810,16 @@ class RewardModelWorker(Worker):
         trust_remote_code = config.model.get('trust_remote_code', False)
         model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
         model_config.num_labels = 1
+
+        use_remove_padding = config.model.get('use_remove_padding', False)
+        if use_remove_padding:
+            from verl.models.registry import check_model_support_rmpad
+            check_model_support_rmpad(model_config.model_type)
+
+        if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
+            from verl.models.transformers.monkey_patch import apply_monkey_patch
+            apply_monkey_patch(model_config, verbose=True)
+
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         init_context = get_init_weight_context_manager(use_meta_tensor=not model_config.tie_word_embeddings)
 
@@ -717,7 +842,8 @@ class RewardModelWorker(Worker):
             device_id=torch.cuda.current_device(),
             sharding_strategy=ShardingStrategy.FULL_SHARD,  # zero3
             sync_module_states=True,
-            cpu_offload=CPUOffload(offload_params=self.config.model.fsdp_config.param_offload))
+            cpu_offload=CPUOffload(offload_params=self.config.model.fsdp_config.param_offload),
+            forward_prefetch=False)
 
         return reward_module
 
@@ -730,6 +856,7 @@ class RewardModelWorker(Worker):
 
     def _forward_micro_batch(self, micro_batch):
         from flash_attn.bert_padding import pad_input, unpad_input, index_first_axis, rearrange
+        from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 
         with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             input_ids = micro_batch['input_ids']
@@ -745,6 +872,13 @@ class RewardModelWorker(Worker):
                 # unpad the position_ids to align the rotary
                 position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
                                                       indices).transpose(0, 1)
+
+                # pad and slice the inputs if sp > 1
+                if self.ulysses_sequence_parallel_size > 1:
+                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(input_ids_rmpad, \
+                                                                                                position_ids_rmpad, \
+                                                                                                sp_size=self.ulysses_sequence_parallel_size)
+
                 # only pass input_ids and position_ids to enable flash_attn_varlen
                 output = self.reward_module(input_ids=input_ids_rmpad,
                                             attention_mask=None,
@@ -752,6 +886,13 @@ class RewardModelWorker(Worker):
                                             use_cache=False)  # prevent model thinks we are generating
                 reward_rmpad = output.logits
                 reward_rmpad = reward_rmpad.squeeze(0)  # (total_nnz)
+
+                # gather output if sp > 1
+                if self.ulysses_sequence_parallel_size > 1:
+                    reward_rmpad = gather_outpus_and_unpad(reward_rmpad,
+                                                           gather_dim=0,
+                                                           unpad_dim=0,
+                                                           padding_size=pad_size)
 
                 # pad it back
                 rm_score = pad_input(reward_rmpad, indices=indices, batch=batch_size, seqlen=seqlen).squeeze(-1)
@@ -841,20 +982,42 @@ class RewardModelWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_rm_score(self, data: DataProto):
+        import itertools
+        from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
         data = data.to('cuda')
         if self._do_switch_chat_template:
             rm_data = self._switch_chat_template(data)
 
         rm_data.batch = rm_data.batch.cuda()
-        micro_batches = rm_data.batch.split(self.config.micro_batch_size)
-        output = []
-        for micro_batch in micro_batches:
-            rm_score = self._forward_micro_batch(micro_batch)
-            output.append(rm_score)
-        scores = torch.cat(output, dim=0)  # (batch_size)
-        token_level_scores = self._expand_to_token_level(data, scores)
-        # Note that this is only the scores, may not be the final rewards used to train RL
-        output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
+
+        # perform forward computation
+        with self.ulysses_sharding_manager:
+            rm_data = self.ulysses_sharding_manager.preprocess_data(data=rm_data)
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+
+            use_dynamic_bsz = self.config.use_dynamic_bsz
+            if use_dynamic_bsz:
+                max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                micro_batches, indices = rearrange_micro_batches(batch=rm_data.batch, max_token_len=max_token_len)
+            else:
+                micro_batches = rm_data.batch.split(self.config.micro_batch_size)
+            output = []
+            for micro_batch in micro_batches:
+                rm_score = self._forward_micro_batch(micro_batch)
+                output.append(rm_score)
+            scores = torch.cat(output, dim=0)  # (batch_size)
+
+            if use_dynamic_bsz:
+                indices = list(itertools.chain.from_iterable(indices))
+                assert len(indices) == scores.size(0), f"{len(indices)} vs. {scores.size()}"
+                revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+                scores = scores[revert_indices]
+
+            token_level_scores = self._expand_to_token_level(data, scores)
+            # Note that this is only the scores, may not be the final rewards used to train RL
+            output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+
         output = output.to('cpu')
         torch.cuda.empty_cache()
         return output
