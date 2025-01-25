@@ -496,56 +496,7 @@ class FSDPSFTTrainer(object):
                 hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
         torch.distributed.barrier()
     
-    def debug(self):
-        """Debug function to compare original forward pass with ulysses_sp and use_remove_padding features"""
-        if self.device_mesh.get_rank() == 0:
-            print("\nStarting debug comparison between original and SP+rmpad forward passes...")
-            print(f"Sequence parallel size: {self.config.ulysses_sequence_parallel_size}")
-            print(f"Remove padding: {self.use_remove_padding}\n")
 
-        total_steps = 4
-
-        for epoch in range(1):  # Just one epoch for debugging
-            self.train_sampler.set_epoch(epoch=epoch)
-            for data in self.train_dataloader:
-                data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
-                self.fsdp_model.train()
-                micro_batches = data.split(self.config.data.micro_batch_size)
-                
-                for idx, micro_batch in enumerate(micro_batches):
-                    if self.device_mesh.get_rank() == 0:
-                        print(f"\nProcessing micro batch {idx + 1}/{len(micro_batches)}")
-                    # Compute losses using both methods
-                    loss_ref = self._compute_loss_and_backward(micro_batch.copy(), do_backward=False)
-                    loss_sp = self._compute_loss_and_backward_sp(micro_batch.copy(), do_backward=False)
-                    
-                    # Collect losses across all ranks
-                    loss_ref_all = loss_ref.clone()
-                    loss_sp_all = loss_sp.clone()
-                    torch.distributed.all_reduce(loss_ref_all, op=torch.distributed.ReduceOp.AVG)
-                    torch.distributed.all_reduce(loss_sp_all, op=torch.distributed.ReduceOp.AVG)
-                    
-                    # Calculate relative difference of averaged losses
-                    rel_diff = torch.abs(loss_ref_all - loss_sp_all) / (torch.abs(loss_ref_all) + 1e-8)
-                    
-                    if self.device_mesh.get_rank() == 0:
-                        print("\nComparison Results (Averaged across ranks):")
-                        print(f"Reference Loss: {loss_ref_all.item():.6f}")
-                        print(f"SP+rmpad Loss: {loss_sp_all.item():.6f}") 
-                        print(f"Relative Difference: {rel_diff.item():.6f}")
-                        
-                        assert rel_diff.item() < 1e-2, "Significant difference detected between averaged losses!"
-
-                    
-                    total_steps -= 1
-                    if total_steps == 0:
-                        break
-                if total_steps == 0:
-                    break
-            break
-
-        if self.device_mesh.get_rank() == 0:
-            print("\nDebug comparison completed.")
 
     def fit(self):
         rank = self.device_mesh.get_rank()
@@ -634,10 +585,7 @@ def main(config):
         device_mesh=device_mesh,
         ulysses_device_mesh=ulysses_device_mesh
     )
-    if config.debug:
-        trainer.debug()
-    else:
-        trainer.fit()
+    trainer.fit()
 
 
 if __name__ == '__main__':
