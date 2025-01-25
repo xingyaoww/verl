@@ -33,7 +33,7 @@ def extract_solution(solution_str):
     return content, count
 
 
-def compute_score(solution_str: str, ground_truth: bool, method='strict', format_score=0., score=1.):
+def compute_score(solution_str: str, ground_truth: bool):
     """The scoring function for Generative ORM.
 
     Args:
@@ -46,7 +46,7 @@ def compute_score(solution_str: str, ground_truth: bool, method='strict', format
     do_print = random.randint(1, 32) == 1
     SEP = "Please first provide your evaluation of the agent's overall problem-solving approach and effectiveness, then provide the reward value (integer between 0 and 100, inclusive) enclosed in <reward>...</reward> tags."
     solution_str = solution_str.split(SEP)[-1]
-    reward, count = extract_solution(solution_str=solution_str, method=method)
+    reward, count = extract_solution(solution_str=solution_str)
 
     if do_print:
         print(f"===================================")
