@@ -33,7 +33,7 @@ def extract_solution(solution_str):
     return content, count
 
 
-def compute_score(solution_str: str, ground_truth: bool):
+def compute_score(solution_str: str, ground_truth: bool, score=1.):
     """The scoring function for Generative ORM.
 
     Args:
