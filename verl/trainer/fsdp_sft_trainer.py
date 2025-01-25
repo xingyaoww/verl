@@ -142,8 +142,7 @@ class FSDPSFTTrainer(object):
                                         response_key=config.data.response_key,
                                         response_dict_keys=config.data.get('response_dict_keys', None),
                                         max_length=config.data.max_length,
-                                        truncation=config.data.truncation,
-                                        skip_template_apply=config.data.skip_template_apply)
+                                        truncation=config.data.truncation)
         self.val_dataset = SFTDataset(parquet_files=config.data.val_files,
                                       tokenizer=self.tokenizer,
                                       prompt_key=config.data.prompt_key,
@@ -151,8 +150,7 @@ class FSDPSFTTrainer(object):
                                       response_key=config.data.response_key,
                                       response_dict_keys=config.data.get('response_dict_keys', None),
                                       max_length=config.data.max_length,
-                                      truncation=config.data.truncation,
-                                      skip_template_apply=config.data.skip_template_apply)
+                                      truncation=config.data.truncation)
 
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
