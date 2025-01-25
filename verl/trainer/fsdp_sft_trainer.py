@@ -55,18 +55,6 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_SFT_LOGGING_LEVEL', 'WARN'))
 
 
-def debug_print(msg, rank=None):
-    from termcolor import colored
-    prefix = f'rank={torch.distributed.get_rank()}'
-    if rank is not None and torch.distributed.get_rank() == rank:
-        print(colored(f'{prefix}: {msg}', "magenta"))
-    elif rank is None:
-        if torch.distributed.get_rank() == 0:
-            print(colored(f'{prefix}: {msg}', "magenta"))
-        else:
-            print(colored(f'{prefix}: {msg}', "green"))
-
-
 def extract_step(path):
     match = re.search(r'global_step_(\d+)', path)
     if match:
@@ -176,7 +164,7 @@ class FSDPSFTTrainer(object):
                                            num_workers=8,
                                            pin_memory=True,
                                            drop_last=True)
-        debug_print(f'sampler initialized with num_replicas: {world_size}, rank: {rank}, drop_last: {True}')
+
         self.val_sampler = DistributedSampler(self.val_dataset,
                                               shuffle=True,
                                               num_replicas=world_size,
@@ -213,7 +201,6 @@ class FSDPSFTTrainer(object):
         if self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1:
             from verl.models.transformers.monkey_patch import apply_monkey_patch
             apply_monkey_patch(config, verbose=True)
-            debug_print(f'Model config after monkey patch: {config}')
 
         # This may be very large
         init_context = get_init_weight_context_manager(use_meta_tensor=not config.tie_word_embeddings)
@@ -225,7 +212,7 @@ class FSDPSFTTrainer(object):
             override_config_kwargs['rope_scaling'] = dict(self.config.model.rope_scaling)
             print(f'rope_scaling setted. rope_scaling={override_config_kwargs["rope_scaling"]}')
         update_model_config(config, override_config_kwargs=override_config_kwargs)
-        debug_print(f'Model config after override: {config}', rank=0)
+        print(f'Model config after override: {config}')
 
         with init_context():
             self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(local_model_path,
@@ -402,7 +389,6 @@ class FSDPSFTTrainer(object):
                 valid_token_this_rank = torch.sum(loss_mask)
 
                 if self.config.data.balance_dp_token:
-                    debug_print("Balance DP token is on")
                     torch.distributed.all_reduce(valid_token_this_rank)  # becomes total valid tokens in all ranks
                     assert self.ulysses_device_mesh is not None
                     dp_size = self.ulysses_device_mesh.size('dp')
