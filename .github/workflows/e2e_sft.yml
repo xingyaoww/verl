@@ -48,3 +48,7 @@ jobs:
         run: |
           ray stop --force
           bash examples/sft/gsm8k/run_qwen_05_sp2.sh 8 $HOME/ckpts/
+      - name: Check loss difference between sequence parallel vs. default implementation
+        run: |
+          ray stop --force
+          bash tests/sft/run_sft_sp_loss_match.sh

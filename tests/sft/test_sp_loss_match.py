@@ -16,7 +16,8 @@ import torch
 import torch.distributed
 from tensordict import TensorDict
 from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer
-from verl.utils.distributed import initialize_global_process_group, init_device_mesh
+from torch.distributed.device_mesh import init_device_mesh
+from verl.utils.distributed import initialize_global_process_group
 
 
 def test_trainer_forward_consistency(trainer: FSDPSFTTrainer, total_steps: int = 4):
@@ -64,6 +65,7 @@ def test_trainer_forward_consistency(trainer: FSDPSFTTrainer, total_steps: int =
                     print(f"Relative Difference: {rel_diff.item():.6f}")
 
                     assert rel_diff.item() < 1e-2, "Significant difference detected between averaged losses!"
+                    print("Loss difference is within the acceptable range.")
 
                 steps_remaining -= 1
                 if steps_remaining == 0:
@@ -111,7 +113,7 @@ if __name__ == '__main__':
     import hydra
     from omegaconf import DictConfig
 
-    @hydra.main(config_path="../../conf", config_name="config")
+    @hydra.main(config_path="../../verl/trainer/config", config_name="sft_trainer")
     def hydra_entry(cfg: DictConfig) -> None:
         main(cfg)
 
