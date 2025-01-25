@@ -29,5 +29,4 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     trainer.total_training_steps=1 \
     trainer.default_hdfs_dir=null $@ \
     +ulysses_sequence_parallel_size=2 \
-    +use_remove_padding=true \
-    +debug=false
+    +use_remove_padding=true
