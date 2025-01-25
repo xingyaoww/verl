@@ -1,5 +1,3 @@
-# Tested with 2 & 4 GPUs
-
 set -x
 
 if [ "$#" -lt 2 ]; then
