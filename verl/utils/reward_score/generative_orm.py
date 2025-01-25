@@ -52,7 +52,7 @@ def compute_score(solution_str: str, ground_truth: bool, method='strict', format
 
     if reward is None:
         if do_print:
-            print(f"No reward found in solution_str: {solution_str}. Reward: 0")
+            print(f"No reward found in solution_str. Reward: 0")
         return 0
 
     # Try convert reward to int
