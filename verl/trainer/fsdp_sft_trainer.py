@@ -54,6 +54,7 @@ from verl import DataProto
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_SFT_LOGGING_LEVEL', 'WARN'))
 
+
 def debug_print(msg, rank=None):
     from termcolor import colored
     prefix = f'rank={torch.distributed.get_rank()}'
@@ -61,9 +62,10 @@ def debug_print(msg, rank=None):
         print(colored(f'{prefix}: {msg}', "magenta"))
     elif rank is None:
         if torch.distributed.get_rank() == 0:
-            print(colored(f'{prefix}: {msg}', "magenta")) 
+            print(colored(f'{prefix}: {msg}', "magenta"))
         else:
             print(colored(f'{prefix}: {msg}', "green"))
+
 
 def extract_step(path):
     match = re.search(r'global_step_(\d+)', path)
@@ -86,12 +88,7 @@ def convert_to_regular_types(obj):
 
 class FSDPSFTTrainer(object):
 
-    def __init__(
-            self,
-            config,
-            device_mesh: DeviceMesh,
-            ulysses_device_mesh: DeviceMesh
-        ):
+    def __init__(self, config, device_mesh: DeviceMesh, ulysses_device_mesh: DeviceMesh):
         self.config = config
         self.device_mesh = device_mesh
         self.ulysses_device_mesh = ulysses_device_mesh
@@ -230,7 +227,6 @@ class FSDPSFTTrainer(object):
         update_model_config(config, override_config_kwargs=override_config_kwargs)
         debug_print(f'Model config after override: {config}', rank=0)
 
-
         with init_context():
             self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(local_model_path,
                                                                                config=config,
@@ -360,24 +356,21 @@ class FSDPSFTTrainer(object):
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
 
                 # Remove padding
-                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
+                                                           attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 
                 # Unpad position_ids to align rotary
                 position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
-                                                  indices).transpose(0, 1)
-
-
+                                                      indices).transpose(0, 1)
 
                 # Pad and slice inputs for sequence parallelism
                 input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(
-                    input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size()
-                )
+                    input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size())
                 # For computing loss
                 input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
-                input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
-                    input_ids_rmpad_rolled, None, get_ulysses_sequence_parallel_world_size()
-                )
+                input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(input_ids_rmpad_rolled, None,
+                                                                            get_ulysses_sequence_parallel_world_size())
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
                 # Forward pass
@@ -385,24 +378,23 @@ class FSDPSFTTrainer(object):
                     input_ids=input_ids_rmpad_sliced,
                     attention_mask=None,  # Not needed with flash attention varlen
                     position_ids=position_ids_rmpad_padded,
-                    use_cache=False
-                )
-                
+                    use_cache=False)
+
                 # Compute loss
-                loss_fct = nn.CrossEntropyLoss(
-                    reduction='none',
-                    label_smoothing=self.config.optim.label_smoothing
-                )
-                
+                loss_fct = nn.CrossEntropyLoss(reduction='none', label_smoothing=self.config.optim.label_smoothing)
+
                 # Calculate locally then aggregate
                 logits_rmpad = output.logits.squeeze(0)
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
                 loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
                 # Gather and unpad for sequence parallelism
                 loss = gather_outpus_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-                
+
                 # This is the loss collected from all ulysses ranks
-                full_loss = pad_input(hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen)
+                full_loss = pad_input(hidden_states=loss.unsqueeze(-1),
+                                      indices=indices,
+                                      batch=batch_size,
+                                      seqlen=seqlen)
                 full_loss = full_loss.squeeze(-1)[:, :-1]  # Remove last token's loss
                 full_loss = full_loss.reshape(-1)
                 loss_mask = loss_mask.to(full_loss.device)
@@ -418,7 +410,7 @@ class FSDPSFTTrainer(object):
                     dp_size = 1
 
                 loss = torch.sum(loss) / valid_token_this_rank * dp_size
-                
+
                 # IMPORTANT: WE need to DO BACKWARD inside _compute_loss_and_backward_sp (within the sharding manager)
                 # Otherwise, the backward+grad checkpoint won't use grad checkpoint properly
                 if do_backward:
@@ -493,8 +485,6 @@ class FSDPSFTTrainer(object):
                 hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
                 hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
         torch.distributed.barrier()
-    
-
 
     def fit(self):
         rank = self.device_mesh.get_rank()
@@ -520,7 +510,9 @@ class FSDPSFTTrainer(object):
 
         for epoch in range(self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
-            for data in tqdm(self.train_dataloader, total=self.steps_per_epoch, desc=f"Epoch {epoch+1}/{self.config.trainer.total_epochs}"):
+            for data in tqdm(self.train_dataloader,
+                             total=self.steps_per_epoch,
+                             desc=f"Epoch {epoch+1}/{self.config.trainer.total_epochs}"):
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
                 metric = self.training_step(data)
                 if rank == 0:
@@ -578,11 +570,7 @@ def main(config):
     ulysses_device_mesh = init_device_mesh(device_type='cuda',
                                            mesh_shape=(dp_size, config.ulysses_sequence_parallel_size),
                                            mesh_dim_names=('dp', 'sp'))
-    trainer = FSDPSFTTrainer(
-        config=config,
-        device_mesh=device_mesh,
-        ulysses_device_mesh=ulysses_device_mesh
-    )
+    trainer = FSDPSFTTrainer(config=config, device_mesh=device_mesh, ulysses_device_mesh=ulysses_device_mesh)
     trainer.fit()
 
 

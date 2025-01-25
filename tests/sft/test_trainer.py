@@ -18,6 +18,7 @@ from tensordict import TensorDict
 from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer
 from verl.utils.distributed import initialize_global_process_group, init_device_mesh
 
+
 def test_trainer_forward_consistency(trainer: FSDPSFTTrainer, total_steps: int = 4):
     """Test consistency between original forward pass and SP+rmpad forward passes.
     
@@ -42,7 +43,7 @@ def test_trainer_forward_consistency(trainer: FSDPSFTTrainer, total_steps: int =
             for idx, micro_batch in enumerate(micro_batches):
                 if trainer.device_mesh.get_rank() == 0:
                     print(f"\nProcessing micro batch {idx + 1}/{len(micro_batches)}")
-                
+
                 # Compute losses using both methods
                 loss_ref = trainer._compute_loss_and_backward(micro_batch.copy(), do_backward=False)
                 loss_sp = trainer._compute_loss_and_backward_sp(micro_batch.copy(), do_backward=False)
@@ -74,6 +75,7 @@ def test_trainer_forward_consistency(trainer: FSDPSFTTrainer, total_steps: int =
     if trainer.device_mesh.get_rank() == 0:
         print("\nDebug comparison completed successfully.")
 
+
 def create_trainer(config):
     """Create and initialize a trainer instance with the given config.
     
@@ -85,24 +87,15 @@ def create_trainer(config):
     """
     local_rank, rank, world_size = initialize_global_process_group()
 
-    device_mesh = init_device_mesh(
-        device_type='cuda',
-        mesh_shape=(world_size,),
-        mesh_dim_names=('fsdp',)
-    )
-    
+    device_mesh = init_device_mesh(device_type='cuda', mesh_shape=(world_size,), mesh_dim_names=('fsdp',))
+
     dp_size = world_size // config.ulysses_sequence_parallel_size
-    ulysses_device_mesh = init_device_mesh(
-        device_type='cuda',
-        mesh_shape=(dp_size, config.ulysses_sequence_parallel_size),
-        mesh_dim_names=('dp', 'sp')
-    )
-    
-    return FSDPSFTTrainer(
-        config=config,
-        device_mesh=device_mesh,
-        ulysses_device_mesh=ulysses_device_mesh
-    )
+    ulysses_device_mesh = init_device_mesh(device_type='cuda',
+                                           mesh_shape=(dp_size, config.ulysses_sequence_parallel_size),
+                                           mesh_dim_names=('dp', 'sp'))
+
+    return FSDPSFTTrainer(config=config, device_mesh=device_mesh, ulysses_device_mesh=ulysses_device_mesh)
+
 
 def main(config):
     """Main function to run trainer tests.
@@ -112,6 +105,7 @@ def main(config):
     """
     trainer = create_trainer(config)
     test_trainer_forward_consistency(trainer)
+
 
 if __name__ == '__main__':
     import hydra
