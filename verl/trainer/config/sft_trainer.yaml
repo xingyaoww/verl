@@ -9,7 +9,6 @@ data:
   truncation: error
   balance_dp_token: False
   chat_template: null
-  skip_template_apply: False
 model:
   partial_pretrain: ~/models/gemma-1.1-7b-it
   fsdp_config:
@@ -29,7 +28,6 @@ optim:
   weight_decay: 0.01
   warmup_steps_ratio: 0.1
   clip_grad: 1.0
-  label_smoothing: 0.0
 
 trainer:
   default_local_dir: /tmp/sft_model

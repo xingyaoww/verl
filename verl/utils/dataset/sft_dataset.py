@@ -24,7 +24,6 @@ import pandas as pd
 
 import torch
 from torch.utils.data import Dataset
-from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from verl.utils.fs import copy_local_path_from_hdfs
@@ -44,12 +43,10 @@ class SFTDataset(Dataset):
                  prompt_dict_keys=None,
                  response_key='response',
                  response_dict_keys=None,
-                 skip_template_apply=False,
                  max_length=1024,
                  truncation='error'):
         assert truncation in ['error', 'left', 'right']
         self.truncation = truncation
-        self.skip_template_apply = skip_template_apply
 
         if not isinstance(parquet_files, List):
             parquet_files = [parquet_files]
@@ -88,7 +85,6 @@ class SFTDataset(Dataset):
             dataframes.append(dataframe)
         self.dataframe = pd.concat(dataframes)
         self.prompts = self.dataframe[self.prompt_key]
-
         for key in self.prompt_dict_keys:
             # type(x): pandas.core.series.Series
             # type(x[0]): numpy.ndarray
@@ -98,7 +94,7 @@ class SFTDataset(Dataset):
             except Exception:
                 print(f'self.prompts={self.prompts}')
                 raise
-        self.prompts = self.prompts['prompt'].tolist()
+        self.prompts = self.prompts.tolist()
         self.responses = self.dataframe[self.response_key]
         for key in self.response_dict_keys:
             try:
@@ -106,7 +102,7 @@ class SFTDataset(Dataset):
             except Exception:
                 print(f'self.responses={self.responses}')
                 raise
-        self.responses = self.responses['answer'].tolist()
+        self.responses = self.responses.tolist()
 
     def __len__(self):
         return len(self.prompts)
@@ -117,22 +113,12 @@ class SFTDataset(Dataset):
         prompt = self.prompts[item]
         response = self.responses[item]
 
+        # apply chat template
+        prompt_chat = [{'role': 'user', 'content': prompt}]
 
-        if not self.skip_template_apply:
-            # apply chat template
-            prompt_chat = [{'role': 'user', 'content': prompt}]
-            # string
-            prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
-            response_chat_str = response + tokenizer.eos_token
-        else:
-            prompt_chat_str = prompt
-            response_chat_str = response
-        
-        # if item == 0:
-        #     print('=' * 100)
-        #     print(f'prompt_chat_str={prompt_chat_str}')
-        #     print(f'response_chat_str={response_chat_str}')
-        #     print('=' * 100)
+        # string
+        prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
+        response_chat_str = response + tokenizer.eos_token
 
         # tokenize
         prompt_ids_output = tokenizer(prompt_chat_str, return_tensors='pt', add_special_tokens=False)
