@@ -534,10 +534,8 @@ class FSDPSFTTrainer(object):
                         print(f"SP+rmpad Loss: {loss_sp_all.item():.6f}") 
                         print(f"Relative Difference: {rel_diff.item():.6f}")
                         
-                        if rel_diff.item() > 1e-5:
-                            print("\nWARNING: Significant difference detected between averaged losses!")
-                        else:
-                            print("\nAveraged losses match within tolerance.")
+                        assert rel_diff.item() < 1e-2, "Significant difference detected between averaged losses!"
+
                     
                     total_steps -= 1
                     if total_steps == 0:
