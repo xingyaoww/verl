@@ -17,7 +17,6 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
-import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -586,10 +585,7 @@ class RayPPOTrainer(object):
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
-                        _start = time.time()
-                        print("BEGIN generate sequences", flush=True)
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        print(f"END generate sequences ({time.time() - _start:.2f}s)", flush=True)
 
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
@@ -607,33 +603,22 @@ class RayPPOTrainer(object):
 
                     # recompute old_log_probs
                     with _timer('old_log_prob', timing_raw):
-                        _start = time.time()
-                        print("BEGIN compute_log_prob", flush=True)
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        print(f"END compute_log_prob ({time.time() - _start:.2f}s)", flush=True)
                         batch = batch.union(old_log_prob)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
-                            _start = time.time()
-                            print("BEGIN compute_ref_log_prob", flush=True)
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            print(f"END compute_ref_log_prob ({time.time() - _start:.2f}s)", flush=True)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:
                         with _timer('values', timing_raw):
-                            _start = time.time()
-                            print("BEGIN compute_values", flush=True)
                             values = self.critic_wg.compute_values(batch)
-                            print(f"END compute_values ({time.time() - _start:.2f}s)", flush=True)
                             batch = batch.union(values)
 
                     with _timer('adv', timing_raw):
-                        _start = time.time()
-                        print("BEGIN compute_rm_score", flush=True)
                         # compute scores. Support both model and function-based.
                         # We first compute the scores using reward model. Then, we call reward_fn to combine
                         # the results from reward model and rule-based results.
@@ -661,45 +646,33 @@ class RayPPOTrainer(object):
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
-                        print(f"END compute_rm_score ({time.time() - _start:.2f}s)", flush=True)
 
                     # update critic
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
-                            _start = time.time()
-                            print("BEGIN update_critic", flush=True)
                             critic_output = self.critic_wg.update_critic(batch)
-                            print(f"END update_critic ({time.time() - _start:.2f}s)", flush=True)
-                            critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        # update actor
                         with _timer('update_actor', timing_raw):
-                            _start = time.time()
-                            print("BEGIN update_actor", flush=True)
                             actor_output = self.actor_rollout_wg.update_actor(batch)
-                            print(f"END update_actor ({time.time() - _start:.2f}s)", flush=True)
-                            actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
                         self.global_steps % self.config.trainer.test_freq == 0:
                         with _timer('testing', timing_raw):
-                            _start = time.time()
-                            print("BEGIN testing", flush=True)
                             val_metrics: dict = self._validate()
-                            print(f"END testing ({time.time() - _start:.2f}s)", flush=True)
                         metrics.update(val_metrics)
 
                     if self.config.trainer.save_freq > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
                         with _timer('save_checkpoint', timing_raw):
-                            _start = time.time()
-                            print("BEGIN save_checkpoint", flush=True)
                             self._save_checkpoint()
-                            print(f"END save_checkpoint ({time.time() - _start:.2f}s)", flush=True)
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
@@ -714,10 +687,7 @@ class RayPPOTrainer(object):
 
                     # perform validation after training
                     if self.val_reward_fn is not None:
-                        _start = time.time()
-                        print("BEGIN testing", flush=True)
                         val_metrics = self._validate()
-                        print(f"END testing ({time.time() - _start:.2f}s)", flush=True)
                         pprint(f'Final validation metrics: {val_metrics}')
                         logger.log(data=val_metrics, step=self.global_steps)
                     return
