@@ -216,5 +216,6 @@ def test_hf_casual_fwd_bwd():
 
 if __name__ == '__main__':
     local_rank, rank, world_size = initialize_global_process_group()
+    print(f'local_rank: {local_rank}, rank: {rank}, world_size: {world_size}')
     test_hf_casual_fwd()
     test_hf_casual_fwd_bwd()
