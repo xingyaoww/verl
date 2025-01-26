@@ -15,10 +15,10 @@
 The main entry point to run the PPO algorithm
 """
 
-import logging
 import os
+import logging
 import warnings
-
+import ray
 import torch
 import torch.distributed
 from torch.distributed.device_mesh import init_device_mesh
@@ -26,20 +26,27 @@ import verl.utils.hdfs_io as hdfs_io
 import verl.utils.torch_functional as verl_F
 from omegaconf import DictConfig, open_dict
 from verl import DataProto
+from omegaconf import DictConfig, open_dict
+from transformers import AutoModelForCausalLM
+
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import register, Dispatch
-from verl.utils import hf_tokenizer
-from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.fs import copy_local_path_from_hdfs
-from verl.utils.fsdp_utils import get_fsdp_wrap_policy, offload_fsdp_grad, init_fn, get_init_weight_context_manager
-from verl.utils.fsdp_utils import offload_fsdp_optimizer, offload_fsdp_param_and_grad, load_fsdp_optimizer, \
-    load_fsdp_param_and_grad
-from verl.utils.import_utils import import_external_libs
+import verl.utils.torch_functional as verl_F
+from verl import DataProto
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.flops_counter import FlopsCounter
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 from codetiming import Timer
+from verl.utils.fs import copy_local_path_from_hdfs
+from verl.utils.fsdp_utils import get_fsdp_wrap_policy, load_fsdp_grad, offload_fsdp_grad, init_fn, get_init_weight_context_manager
+from verl.utils.fsdp_utils import offload_fsdp_optimizer, offload_fsdp_param_and_grad, load_fsdp_optimizer, load_fsdp_param_and_grad
+from verl.utils.import_utils import import_external_libs
+from verl.utils.debug import log_gpu_memory_usage
+import verl.utils.hdfs_io as hdfs_io
+from verl.utils import hf_tokenizer
+from ..trainer.ppo import core_algos
+from verl.utils.py_functional import append_to_dict
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
@@ -374,6 +381,8 @@ class ActorRolloutRefWorker(Worker):
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
 
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
         torch.cuda.empty_cache()
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -418,6 +427,8 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
         torch.cuda.empty_cache()
         return output
 
@@ -452,6 +463,8 @@ class ActorRolloutRefWorker(Worker):
             # NOTE(sgm): the grad is already in CPU, only offload param here
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
         # clear kv cache
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
@@ -507,6 +520,10 @@ class ActorRolloutRefWorker(Worker):
         if self.world_size > 1:
             self.ref_policy.actor_module._handle.reshard(True)
 
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.ref_module_fsdp, offload_grad=self._is_offload_grad)
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
         torch.cuda.empty_cache()
         return output
 
@@ -581,7 +598,8 @@ class CriticWorker(Worker):
         # the following line is necessary
         from verl.utils.model import LambdaLayer, print_model_size, squeeze
         from verl.utils.torch_dtypes import PrecisionType
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision, \
+            CPUOffload
         from torch import optim
 
         local_path = copy_local_path_from_hdfs(config.model.path)
@@ -724,7 +742,7 @@ class CriticWorker(Worker):
             load_fsdp_param_and_grad(module=self.critic_module,
                                      device_id=torch.cuda.current_device(),
                                      load_grad=self._is_offload_grad)
-        micro_batch_size = self.config.forward_micro_batch_size
+        micro_batch_size = self.config.ppo_micro_batch_size
         data.meta_info['micro_batch_size'] = micro_batch_size
         data.meta_info['max_token_len'] = self.config.forward_max_token_len_per_gpu
         data.meta_info['use_dynamic_bsz'] = self.config.use_dynamic_bsz
@@ -1079,3 +1097,370 @@ class RewardModelWorker(Worker):
         output = output.to('cpu')
         torch.cuda.empty_cache()
         return output
+
+class PRIMERewardModelWorker(Worker):
+    """
+    PRIME reward model.
+    Can update itself whenever compute_rm_score is called.
+    """
+    def __init__(self, config):
+        super().__init__()
+        import torch.distributed
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        self.config = config
+
+        self.config.micro_batch_size //= torch.distributed.get_world_size()
+
+        self._is_offload_param = self.config.prime_model.fsdp_config.get('param_offload', False)
+        self._is_offload_grad = self.config.prime_model.fsdp_config.get('grad_offload', False)
+        self._is_offload_optimizer = self.config.prime_model.fsdp_config.get('optimizer_offload', False)
+
+    def _build_model_optimizer(self, config, enable_gradient_checkpointing=False):
+        # the following line is necessary
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoConfig
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, CPUOffload
+
+        # download the checkpoint from hdfs
+        local_path = copy_local_path_from_hdfs(config.prime_model.path)
+
+        if self.config.prime_model.input_tokenizer is None:
+            self._do_switch_chat_template = False
+        else:
+            self._do_switch_chat_template = True
+            input_tokenizer_local_path = copy_local_path_from_hdfs(config.prime_model.input_tokenizer)
+            self.input_tokenizer = hf_tokenizer(input_tokenizer_local_path,
+                                                trust_remote_code=config.prime_model.get('trust_remote_code', False))
+            self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.prime_model.get('trust_remote_code', False))
+
+        trust_remote_code = config.prime_model.get('trust_remote_code', False)
+        model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+        # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
+        init_context = get_init_weight_context_manager(use_meta_tensor=not model_config.tie_word_embeddings)
+
+        with init_context(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            reward_module = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=local_path,
+                                                                               torch_dtype=torch.float32,
+                                                                               attn_implementation='flash_attention_2',
+                                                                               trust_remote_code=trust_remote_code)
+            reward_module.to(torch.float32)
+            if enable_gradient_checkpointing:
+                reward_module.gradient_checkpointing_enable()
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision
+        mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32,
+                                         buffer_dtype=torch.float32)
+        if config.prime_model.get("ref_type", 'freeze') == 'freeze':
+            reference_module = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=copy_local_path_from_hdfs(config.prime_model.ref_path),
+                torch_dtype=torch.bfloat16,
+                attn_implementation='flash_attention_2',
+                trust_remote_code=trust_remote_code)
+            reference_module.to(torch.bfloat16)
+            for param in reference_module.parameters():
+                param.requires_grad = False
+        else:
+            reference_module = None
+
+        auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.prime_model.fsdp_config)
+
+        reward_module = FSDP(
+            reward_module,
+            param_init_fn=init_fn,
+            use_orig_params=False,
+            auto_wrap_policy=auto_wrap_policy,
+            device_id=torch.cuda.current_device(),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,  # zero3
+            mixed_precision=mixed_precision,
+            sync_module_states=True)
+
+        auto_wrap_policy = get_fsdp_wrap_policy(module=reference_module, config=self.config.prime_model.fsdp_config)
+        if reference_module is not None:
+            reference_module = FSDP(
+                reference_module,
+                param_init_fn=init_fn,
+                use_orig_params=False,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=torch.cuda.current_device(),
+                sharding_strategy=ShardingStrategy.FULL_SHARD,  # zero3
+                sync_module_states=True)
+
+        self.update_dpo_type = self.config.prime_model.get('update', 'none')
+        if self.update_dpo_type in ['before', 'after']:
+
+            from torch import optim
+            self.reward_optimizer = optim.AdamW(reward_module.parameters(),
+                                                lr=config.prime_model.optim.lr,
+                                                betas=config.prime_model.optim.get('betas', (0.9, 0.999)),
+                                                weight_decay=config.prime_model.optim.get('weight_decay', 1e-2))
+
+            total_steps = config.prime_model.optim.get('total_training_steps', 0)
+            num_warmup_steps_ratio = config.prime_model.optim.get('lr_warmup_steps_ratio', 0.)
+            num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+
+            print(f'Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}')
+
+            from verl.utils.torch_functional import get_constant_schedule_with_warmup
+            self.reward_lr_scheduler = get_constant_schedule_with_warmup(optimizer=self.reward_optimizer,
+                                                                         num_warmup_steps=num_warmup_steps)
+
+            # fsdp offload configurations
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.reward_optimizer)
+
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=reward_module, offload_grad=self._is_offload_grad)
+            if reference_module is not None:
+                offload_fsdp_param_and_grad(module=reference_module, offload_grad=self._is_offload_grad)
+
+        return reward_module, reference_module
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        # This is used to import external_lib into the huggingface systems
+        import_external_libs(self.config.prime_model.get('external_lib', None))
+        self.reward_module, self.reference_module = self._build_model_optimizer(config=self.config, enable_gradient_checkpointing=self.config.prime_model.get('enable_gradient_checkpointing', False))
+        torch.cuda.empty_cache()
+
+    def _switch_chat_template(self, data: DataProto):
+        src_max_length = data.batch['attention_mask'].shape[-1]
+
+        src_tokenizer = self.input_tokenizer
+        target_tokenizer = self.tokenizer
+
+        rm_input_ids = []
+        rm_attention_mask = []
+
+        for i in range(data.batch.batch_size[0]):
+            # extract raw prompt
+            chat: list = data.non_tensor_batch['raw_prompt'][i].tolist()
+
+            # extract response
+            response_ids = data.batch['responses'][i]
+            response_length = response_ids.shape[-1]
+            valid_response_length = data.batch['attention_mask'][i][-response_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+
+            # decode
+            response = src_tokenizer.decode(valid_response_ids)
+            # remove bos and eos
+            response = response.replace(src_tokenizer.eos_token, '')
+
+            chat.append({'role': 'assistant', 'content': response})
+
+            prompt_with_chat_template = target_tokenizer.apply_chat_template(chat,
+                                                                             add_generation_prompt=False,
+                                                                             tokenize=False)
+            if self.rank == 0 and i == 0:
+                # for debugging purpose
+                print(f'Switch template. chat: {prompt_with_chat_template}')
+
+            # the maximum length is actually determined by the reward model itself
+            max_length = self.config.get('max_length', src_max_length)
+            if max_length is None:
+                max_length = src_max_length
+            input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
+                prompt=prompt_with_chat_template,
+                tokenizer=target_tokenizer,
+                max_length=max_length,
+                pad_token_id=target_tokenizer.pad_token_id,
+                left_pad=False,  # right padding
+                truncation=self.config.get('truncation', 'right'))  # truncate from the right
+
+            rm_input_ids.append(input_ids)
+            rm_attention_mask.append(attention_mask)
+
+        rm_input_ids = torch.cat(rm_input_ids, dim=0)
+        rm_attention_mask = torch.cat(rm_attention_mask, dim=0)
+
+        rm_position_ids = compute_position_id_with_mask(rm_attention_mask)
+
+        rm_inputs = {'input_ids': rm_input_ids, 'attention_mask': rm_attention_mask, 'position_ids': rm_position_ids}
+
+        return DataProto.from_dict(rm_inputs)
+
+    def _forward_micro_batch(self, micro_batch, prompt_length):
+        rm_output = self.reward_module(input_ids=micro_batch['input_ids'],
+                                       attention_mask=micro_batch['attention_mask'],
+                                       position_ids=micro_batch['position_ids'])
+        rm_log_prob = torch.nn.functional.log_softmax(rm_output.logits[:, :-1, :],
+                                                  dim=-1)  # (batch_size, seq_length, vocab_size)
+        rm_log_labels = rm_log_prob.gather(dim=-1, index=micro_batch['input_ids'][:, 1:].unsqueeze(-1)).squeeze(
+            -1)  # (batch, seq_length)
+        if self.reference_module is not None:
+            with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                ref_output = self.reference_module(input_ids=micro_batch['input_ids'],
+                                                attention_mask=micro_batch['attention_mask'],
+                                                position_ids=micro_batch['position_ids'])
+                ref_log_prob = torch.nn.functional.log_softmax(ref_output.logits[:, :-1, :],
+                                                        dim=-1)  # (batch_size, seq_length, vocab_size)
+                ref_log_labels = ref_log_prob.gather(dim=-1, index=micro_batch['input_ids'][:, 1:].unsqueeze(-1)).squeeze(
+                    -1)  # (batch, seq_length)
+        else:
+            ref_log_labels = micro_batch['old_log_probs']
+
+        num_actions = micro_batch['input_ids'].shape[-1] - prompt_length
+        max_positions = micro_batch['attention_mask'][:, prompt_length:].sum(-1)
+
+        ref_log_labels.to(rm_log_labels.dtype)
+        q = rm_log_labels[:, -num_actions:] - ref_log_labels[:, -num_actions:]  # this is actually diff of q
+
+        # reward computation does not need gradient. only q needs
+        with torch.no_grad():
+            step_ends = []
+
+            if self.config.prime_granularity == 'token':
+                for i in range(micro_batch['input_ids'].shape[0]):
+                    step_ends.append(list(range(max_positions[i])))
+            elif self.config.prime_granularity == 'whole':
+                for i in range(micro_batch['input_ids'].shape[0]):
+                    step_ends.append([max_positions[i] - 1])
+            else:
+                raise NotImplementedError
+
+            token_level_score = torch.zeros_like(micro_batch['input_ids'][:, -num_actions:]).to(torch.float32)
+            # the strategy of translating q to reward function:
+
+            for i, step_end in enumerate(step_ends):
+                for j in range(len(step_end)):
+                    step_range = [min(step_end[j - 1] + 1, num_actions - 1) if j > 0 else 0,
+                                  min(num_actions - 1, step_end[j])]
+                    token_level_score[i, step_range[1]] = q[i, step_range[0]:step_range[1] + 1].sum()
+
+        return token_level_score, q
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_rm_score(self, data: DataProto):
+        data = data.to('cuda')
+        n_samples=data.meta_info['n_samples']
+        beta=self.config.prime_model.get('beta_train', 0.05)
+        if self._do_switch_chat_template:
+            rm_data = self._switch_chat_template(data)
+        else:
+            rm_data=data
+
+        if self.update_dpo_type!='none':
+            if self._is_offload_optimizer:
+                load_fsdp_optimizer(optimizer=self.reward_optimizer, device_id=torch.cuda.current_device())
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.reward_module,device_id=torch.cuda.current_device(),load_grad=self._is_offload_grad)
+            if self.reference_module is not None:
+                load_fsdp_param_and_grad(module=self.reference_module,device_id=torch.cuda.current_device(),load_grad=self._is_offload_grad)
+
+        rm_data.batch = rm_data.batch.cuda()
+        micro_batches = rm_data.batch.split(self.config.micro_batch_size)
+        mini_batch_size = self.config.mini_batch_size // torch.distributed.get_world_size()
+        accumulate_steps = mini_batch_size / self.config.micro_batch_size
+        token_level_scores = []
+
+        metrics = {}
+
+        prompt_ids = data.batch['prompts']
+        prompt_length = prompt_ids.shape[-1]
+        step = 0
+
+        for batch_id, micro_batch in enumerate(micro_batches):  # micro batch is tensordict here, rather than data proto
+            step += micro_batch.batch_size[0]
+            if self.update_dpo_type == 'none':
+                with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+
+                    token_level_score, q = self._forward_micro_batch(micro_batch, prompt_length)
+                    token_level_scores.append(token_level_score)
+            elif self.update_dpo_type in ['after', 'before']:
+                # with torch.autocast(device_type='cuda',dtype=torch.bfloat16):
+                token_level_score, q= self._forward_micro_batch(micro_batch, prompt_length)
+                token_level_scores.append(token_level_score)
+                original_token_level_score = q
+                acc = micro_batch['acc']
+                attention_mask = micro_batch['attention_mask']
+                eos_mask = attention_mask[:, prompt_length:]
+
+                # different losses:
+                if self.config.prime_model.loss_type == 'ce':
+                    dpo_loss = core_algos.compute_ce_dpo_loss_rm(original_token_level_score, acc, eos_mask=eos_mask,
+                                                                 beta=beta)
+                else:
+                    raise NotImplementedError
+
+                data = {
+                    'reward_model/dpo_loss': dpo_loss.detach().item(),
+                }
+                loss = dpo_loss / accumulate_steps
+                loss.backward()
+                append_to_dict(metrics, data)
+            else:
+                raise NotImplementedError
+
+            if self.update_dpo_type in ['after', 'before'] and (batch_id + 1) % accumulate_steps == 0:
+                grad_norm = self._optimizer_step()
+                self.reward_optimizer.zero_grad()
+                data = {'reward_model/grad_norm': grad_norm.detach().item()}
+                append_to_dict(metrics, data)
+
+        # all update strategies need to compute dpo accuracy here.
+        token_level_scores = torch.cat(token_level_scores, 0)
+        acc = rm_data.batch['acc']
+        attention_mask = rm_data.batch['attention_mask']
+        eos_mask = attention_mask[:, prompt_length:]
+        dpo_acc_before = core_algos.compute_dpo_accuracy(token_level_scores, acc, eos_mask=eos_mask,
+                                                         n_samples=n_samples)
+        data = {
+            'reward_model/dpo_acc_before': dpo_acc_before.detach().item(),
+        }
+        append_to_dict(metrics, data)
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        torch.cuda.empty_cache()
+
+        # Double-Forward: if update strategy is 'before', reward should be computed again.
+        if self.update_dpo_type in ['before']:
+            token_level_scores = []
+            for micro_batch in micro_batches:
+                with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    token_level_score, q = self._forward_micro_batch(micro_batch, prompt_length)
+                    token_level_scores.append(token_level_score)
+            token_level_scores = torch.cat(token_level_scores, 0)
+
+            acc = rm_data.batch['acc']
+            attention_mask = rm_data.batch['attention_mask']
+            eos_mask = attention_mask[:, prompt_length:]
+
+            dpo_acc_after = core_algos.compute_dpo_accuracy(token_level_scores, acc, eos_mask=eos_mask,
+                                                            n_samples=n_samples)
+            data = {
+                'reward_model/dpo_acc_after': dpo_acc_after.detach().item(),
+            }
+            append_to_dict(metrics, data)
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            torch.cuda.empty_cache()
+
+        # move batch normalization here
+        if self.config.prime_norm == 'batch_norm':  # this method will still consider the relative value of rewards. The key is to control the absolute value of RETURN from being too high. so the normalization is done by controlling the maximum of reverse cumulative sum
+            reverse_cumsum = torch.cumsum(token_level_scores.flip(dims=[1]), dim=-1).flip(dims=[1])
+            token_level_scores = token_level_scores / (reverse_cumsum.abs().max() + 1e-6)
+
+        output = DataProto.from_dict(tensors={'rm_scores': token_level_scores}, meta_info={'metrics': metrics})
+        if self.update_dpo_type != 'none':
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.reward_optimizer)
+            self.reward_lr_scheduler.step()
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.reward_module, offload_grad=self._is_offload_grad)
+            if self.reference_module is not None:
+                offload_fsdp_param_and_grad(module=self.reference_module, offload_grad=self._is_offload_grad)
+        output = output.to('cpu')
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        torch.cuda.empty_cache()
+        return output
+
+    def _optimizer_step(self):
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        assert self.config.prime_model.optim.grad_clip is not None
+        if isinstance(self.reward_module, FSDP):
+            grad_norm = self.reward_module.clip_grad_norm_(self.config.prime_model.optim.grad_clip)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.reward_module.parameters(), max_norm=self.config.prime_model.optim.grad_clip)
+        self.reward_optimizer.step()
+        return grad_norm

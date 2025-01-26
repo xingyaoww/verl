@@ -144,10 +144,11 @@ class vLLMRollout(BaseRollout):
         if self.config.free_cache_engine:
             self.inference_engine.init_cache_engine()
 
-        idx = prompts.batch['input_ids']  # (bs, prompt_length)
+        n_samples = prompts.meta_info.get('n_samples', 1)
+        idx = prompts.batch['input_ids'].repeat_interleave(n_samples,dim=0)  # (bs, prompt_length)
         # left-padded attention_mask
-        attention_mask = prompts.batch['attention_mask']
-        position_ids = prompts.batch['position_ids']
+        attention_mask = prompts.batch['attention_mask'].repeat_interleave(n_samples,dim=0)
+        position_ids = prompts.batch['position_ids'].repeat_interleave(n_samples,dim=0)
 
         # used to construct attention_mask
         eos_token_id = prompts.meta_info['eos_token_id']
@@ -167,7 +168,6 @@ class vLLMRollout(BaseRollout):
                 'top_k': -1,
                 'min_p': 0.0,
                 'temperature': 0,
-                'n': 1  # if greedy, only 1 response
             }
 
         # users can customize different sampling_params at different run
@@ -178,20 +178,13 @@ class vLLMRollout(BaseRollout):
                 prompt_token_ids=idx_list,
                 use_tqdm=True)
 
-        # TODO(sgm): disable logprob when recompute_log_prob is enable
-        # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-        response = output[0].to(idx.device)
-        log_probs = output[1].to(idx.device)
+        response = output[0].to(idx.device)  # (bs, response_length)
+        log_probs = output[1].to(idx.device)  # (bs, response_length)
 
         if response.shape[1] < self.config.response_length:
             response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
             log_probs = pad_sequence_to_length(log_probs, self.config.response_length, self.pad_token_id)
 
-        if self.config.n > 1 and do_sample:
-            idx = idx.repeat_interleave(self.config.n, dim=0)
-            attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
-            position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
-            batch_size = batch_size * self.config.n
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
