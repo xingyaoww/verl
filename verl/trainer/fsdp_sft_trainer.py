@@ -297,17 +297,17 @@ class FSDPSFTTrainer(object):
                     batch_size, seqlen = input_ids.shape
                     input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)
                     input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
-                    position_ids_rmpad = index_first_axis(
-                        rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
+                    position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
+                                                          indices).transpose(0, 1)
 
                     # Prepare inputs for model
                     input_ids_sliced, position_ids_padded, pad_size = ulysses_pad_and_slice_inputs(
                         input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size())
-                    
+
                     # Prepare labels for loss computation
                     input_ids_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)
-                    labels_sliced, _, _ = ulysses_pad_and_slice_inputs(
-                        input_ids_rolled, None, get_ulysses_sequence_parallel_world_size())
+                    labels_sliced, _, _ = ulysses_pad_and_slice_inputs(input_ids_rolled, None,
+                                                                       get_ulysses_sequence_parallel_world_size())
                     labels_sliced = labels_sliced.squeeze(0)
 
                     # Forward pass
@@ -316,7 +316,7 @@ class FSDPSFTTrainer(object):
                         attention_mask=None,  # Not needed with flash attention varlen
                         position_ids=position_ids_padded,
                         use_cache=False)
-                    
+
                     # Compute loss
                     loss_fct = nn.CrossEntropyLoss(reduction='none')
                     logits = output.logits.squeeze(0)
@@ -330,12 +330,11 @@ class FSDPSFTTrainer(object):
                 else:
                     # Standard forward pass without sequence parallel
                     labels = input_ids[:, 1:].contiguous()
-                    output = self.fsdp_model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        use_cache=False)
-                    
+                    output = self.fsdp_model(input_ids=input_ids,
+                                             attention_mask=attention_mask,
+                                             position_ids=position_ids,
+                                             use_cache=False)
+
                     # Compute loss
                     loss_fct = nn.CrossEntropyLoss(reduction='none')
                     logits = output.logits[..., :-1, :].contiguous()
