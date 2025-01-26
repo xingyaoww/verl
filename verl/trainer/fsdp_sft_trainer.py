@@ -280,121 +280,84 @@ class FSDPSFTTrainer(object):
 
     def _compute_loss_and_backward(self, batch, do_backward=True):
         """Compute loss with optional sequence parallelism and remove padding features"""
-        def compute_loss_with_sp():
-            with self.sharding_manager:
-                # IMPORTANT: We have a big assumption here, so we can shard the SAME sequence across SP ranks
-                # i.e., each GPU has <1 sequence, and each SP group has 1 sequence
-                # 1. All SP ranks will receive the *SAME* batch
-                # 2. Different SP groups will receive *DIFFERENT* batches
-                # This is implemented by the DistributedSampler
-                input_ids = batch['input_ids'].cuda()
-                batch_size, seqlen = input_ids.shape
-                attention_mask = batch['attention_mask'].cuda()
-                position_ids = batch['position_ids'].cuda()
-                loss_mask = batch['loss_mask'][:, :-1].reshape(-1).cuda()
+        use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
 
-                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    # Remove padding
-                    input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
-                                                               attention_mask)  # input_ids_rmpad (total_nnz, ...)
+        # Move inputs to GPU and prepare loss mask
+        input_ids = batch['input_ids'].cuda()
+        attention_mask = batch['attention_mask'].cuda()
+        position_ids = batch['position_ids'].cuda()
+        loss_mask = batch.pop('loss_mask')[:, :-1].reshape(-1).cuda()
+
+        # Context manager for sequence parallel if needed
+        context = self.sharding_manager if use_sp else nullcontext()
+        with context:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                if use_sp:
+                    # Remove padding and prepare inputs for sequence parallel
+                    batch_size, seqlen = input_ids.shape
+                    input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)
                     input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+                    position_ids_rmpad = index_first_axis(
+                        rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
 
-                    # Unpad position_ids to align rotary
-                    position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
-                                                          indices).transpose(0, 1)
-
-                    # Pad and slice inputs for sequence parallelism
-                    input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(
+                    # Prepare inputs for model
+                    input_ids_sliced, position_ids_padded, pad_size = ulysses_pad_and_slice_inputs(
                         input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size())
-                    # For computing loss
-                    input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
-                    input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(input_ids_rmpad_rolled, None,
-                                                                                get_ulysses_sequence_parallel_world_size())
-                    input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
+                    
+                    # Prepare labels for loss computation
+                    input_ids_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)
+                    labels_sliced, _, _ = ulysses_pad_and_slice_inputs(
+                        input_ids_rolled, None, get_ulysses_sequence_parallel_world_size())
+                    labels_sliced = labels_sliced.squeeze(0)
 
                     # Forward pass
                     output = self.fsdp_model(
-                        input_ids=input_ids_rmpad_sliced,
+                        input_ids=input_ids_sliced,
                         attention_mask=None,  # Not needed with flash attention varlen
-                        position_ids=position_ids_rmpad_padded,
+                        position_ids=position_ids_padded,
                         use_cache=False)
-
+                    
                     # Compute loss
                     loss_fct = nn.CrossEntropyLoss(reduction='none')
+                    logits = output.logits.squeeze(0)
+                    labels_sliced = labels_sliced.to(logits.device)
+                    loss = loss_fct(logits, labels_sliced)
 
-                    # Calculate locally then aggregate
-                    logits_rmpad = output.logits.squeeze(0)
-                    input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
-                    loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
                     # Gather and unpad for sequence parallelism
                     loss = gather_outpus_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+                    loss = pad_input(hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen)
+                    loss = loss.squeeze(-1)[:, :-1].reshape(-1)
+                else:
+                    # Standard forward pass without sequence parallel
+                    labels = input_ids[:, 1:].contiguous()
+                    output = self.fsdp_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        use_cache=False)
+                    
+                    # Compute loss
+                    loss_fct = nn.CrossEntropyLoss(reduction='none')
+                    logits = output.logits[..., :-1, :].contiguous()
+                    logits = logits.view(-1, self.model.config.vocab_size)
+                    labels = labels.view(-1).to(logits.device)
+                    loss = loss_fct(logits, labels)
 
-                    # This is the loss collected from all ulysses ranks
-                    full_loss = pad_input(hidden_states=loss.unsqueeze(-1),
-                                          indices=indices,
-                                          batch=batch_size,
-                                          seqlen=seqlen)
-                    full_loss = full_loss.squeeze(-1)[:, :-1]  # Remove last token's loss
-                    full_loss = full_loss.reshape(-1)
-                    loss_mask = loss_mask.to(full_loss.device)
-                    loss = full_loss * loss_mask
-                    valid_token_this_rank = torch.sum(loss_mask)
+                # Common loss computation steps
+                loss = loss * loss_mask.to(loss.device)
+                valid_token_this_rank = torch.sum(loss_mask)
 
-                    if self.config.data.balance_dp_token:
-                        torch.distributed.all_reduce(valid_token_this_rank)  # becomes total valid tokens in all ranks
-                        assert self.ulysses_device_mesh is not None
-                        dp_size = self.ulysses_device_mesh.size('dp')
-                    else:
-                        dp_size = 1
+                if self.config.data.balance_dp_token:
+                    torch.distributed.all_reduce(valid_token_this_rank)
+                    dp_size = self.ulysses_device_mesh.size('dp') if use_sp else torch.distributed.get_world_size()
+                else:
+                    dp_size = 1
 
-                    loss = torch.sum(loss) / valid_token_this_rank * dp_size
+                loss = torch.sum(loss) / valid_token_this_rank * dp_size
 
-                    # IMPORTANT: WE need to DO BACKWARD inside _compute_loss_and_backward_sp (within the sharding manager)
-                    # Otherwise, the backward+grad checkpoint won't use grad checkpoint properly
-                    if do_backward:
-                        loss.backward()
+                if do_backward:
+                    loss.backward()
                 return loss
-
-        def compute_loss_without_sp():
-            loss_mask = batch.pop('loss_mask')[:, :-1].reshape(-1).cuda()
-            labels = batch['input_ids'][:, 1:].cuda()
-
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                output = self.fsdp_model(input_ids=batch['input_ids'],
-                                         attention_mask=batch['attention_mask'],
-                                         position_ids=batch['position_ids'],
-                                         use_cache=False)  # prevent model thinks it it generating
-
-            logits = output.logits
-
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels.contiguous()
-            # Flatten the tokens
-            loss_fct = nn.CrossEntropyLoss(reduction='none')
-            shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
-            loss = loss * loss_mask
-
-            valid_token_this_rank = torch.sum(loss_mask)
-
-            if self.config.data.balance_dp_token:
-                torch.distributed.all_reduce(valid_token_this_rank)  # becomes total valid tokens in all ranks
-                dp_size = torch.distributed.get_world_size()
-            else:
-                dp_size = 1
-
-            loss = torch.sum(loss) / valid_token_this_rank * dp_size  # possible bugs here for dp
-            if do_backward:
-                loss.backward()
-            return loss
-
-        if self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1:
-            return compute_loss_with_sp()
-        else:
-            return compute_loss_without_sp()
 
     def training_step(self, batch: TensorDict):
         self.fsdp_model.train()
