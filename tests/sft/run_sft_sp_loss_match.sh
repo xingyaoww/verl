@@ -12,6 +12,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     +data.response_dict_keys=['answer'] \
     data.micro_batch_size=32 \
     model.partial_pretrain=Qwen/Qwen2.5-0.5B-Instruct \
+    ulysses_sequence_parallel_size=2 \
+    use_remove_padding=True \
     trainer.default_local_dir=$HOME/ckpts/ \
     trainer.project_name=qwen2.5-sft \
     trainer.experiment_name=gsm8k-sft-gemma-2b-it \

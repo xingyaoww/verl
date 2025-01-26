@@ -46,8 +46,16 @@ def test_trainer_forward_consistency(trainer: FSDPSFTTrainer, total_steps: int =
                     print(f"\nProcessing micro batch {idx + 1}/{len(micro_batches)}")
 
                 # Compute losses using both methods
+                # Disable SP and rmpad
+                trainer.use_remove_padding = False
+                old_sp = trainer.config.ulysses_sequence_parallel_size
+                trainer.config.ulysses_sequence_parallel_size = 1
                 loss_ref = trainer._compute_loss_and_backward(micro_batch.copy(), do_backward=False)
-                loss_sp = trainer._compute_loss_and_backward_sp(micro_batch.copy(), do_backward=False)
+                
+                # Do SP and rmpad
+                trainer.config.ulysses_sequence_parallel_size = old_sp
+                trainer.use_remove_padding = True
+                loss_sp = trainer._compute_loss_and_backward(micro_batch.copy(), do_backward=False)
 
                 # Collect losses across all ranks
                 loss_ref_all = loss_ref.clone()
