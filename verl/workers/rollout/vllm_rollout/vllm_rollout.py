@@ -39,6 +39,10 @@ from verl.third_party.vllm import LLM, vllm_version
 from verl.third_party.vllm import parallel_state as vllm_ps
 from vllm import SamplingParams
 
+import sys
+# Set higher recursion limit for vllm (otherwise it will crash with a recursion depth error when sequence length is large)
+sys.setrecursionlimit(50000)
+
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
