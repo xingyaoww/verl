@@ -57,7 +57,7 @@ Checkout this [Jupyter Notebook](https://github.com/volcengine/verl/tree/main/ex
 - [Installation](https://verl.readthedocs.io/en/latest/start/install.html)
 - [Quickstart](https://verl.readthedocs.io/en/latest/start/quickstart.html)
 
-**Running an PPO example step-by-step:**
+**Running a PPO example step-by-step:**
 - Data and Reward Preparation
   - [Prepare Data (Parquet) for Post-Training](https://verl.readthedocs.io/en/latest/preparation/prepare_data.html)
   - [Implement Reward Function for Dataset](https://verl.readthedocs.io/en/latest/preparation/reward_function.html)
@@ -98,9 +98,10 @@ If you find the project helpful, please cite:
 
 verl is inspired by the design of Nemo-Aligner, Deepspeed-chat and OpenRLHF. The project is adopted and supported by Anyscale, Bytedance, LMSys.org, Shanghai AI Lab, Tsinghua University, UC Berkeley, UCLA, UIUC, and University of Hong Kong.
 
-## Publications Using veRL
+## Awesome work using veRL
 - [Enhancing Multi-Step Reasoning Abilities of Language Models through Direct Q-Function Optimization](https://arxiv.org/abs/2410.09302)
 - [Flaming-hot Initiation with Regular Execution Sampling for Large Language Models](https://arxiv.org/abs/2410.21236)
 - [Process Reinforcement Through Implicit Rewards](https://github.com/PRIME-RL/PRIME/)
+- [TinyZero](https://github.com/Jiayi-Pan/TinyZero): a reproduction of DeepSeek R1 Zero in countdown and multiplication tasks
 
 We are HIRING! Send us an [email](mailto:haibin.lin@bytedance.com) if you are interested in internship/FTE opportunities in MLSys/LLM reasoning/multimodal alignment.
