@@ -16,10 +16,6 @@ import re
 import random
 
 
-import re
-import random
-
-
 def extract_solution(solution_str):
     pattern = r'<reward>(.*?)</reward>'
     # Find all matches to count total occurrences
