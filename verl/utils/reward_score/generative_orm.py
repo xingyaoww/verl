@@ -48,6 +48,9 @@ def compute_score(solution_str: str, ground_truth: bool, score=1.):
     solution_str = solution_str.split(SEP)[-1]
     reward, count = extract_solution(solution_str=solution_str)
 
+    BASE_SCORE = -1  # default score
+    FORMAT_SCORE = 0.1
+
     if do_print:
         print(f"===================================")
         print(f"Ground truth resolved: {ground_truth}")
@@ -58,34 +61,38 @@ def compute_score(solution_str: str, ground_truth: bool, score=1.):
 
     if reward is None:
         if do_print:
-            print(f"No reward found in solution_str. Reward: 0")
-        return 0
+            print(f"No reward found in solution_str. Reward: {BASE_SCORE} (base score, incorrect format)")
+        return BASE_SCORE
     
     if count > 1:
         if do_print:
-            print(f"Multiple rewards found in solution_str. Reward: 0")
-        return 0
+            print(f"Multiple rewards found in solution_str. Reward: {BASE_SCORE} (base score, incorrect format)")
+        return BASE_SCORE
 
     # Try convert reward to int
     try:
         reward = int(reward)
     except ValueError as e:
         if do_print:
-            print(f"Failed to convert reward to int: {e}. Reward: 0.1 (format score)")
-        return 0.1  # format score
+            print(f"Failed to convert reward to int: {e}. Reward: {BASE_SCORE} (base score, incorrect format)")
+        return BASE_SCORE # format score
 
     # Try assert reward is in [0, 100]
     if reward < 0 or reward > 100:
         if do_print:
-            print(f"Reward is out of range: {reward}. Reward: 0.1 (format score)")
-        return 0.1  # format score
+            print(f"Reward is out of range: {reward}. Reward: {BASE_SCORE + FORMAT_SCORE} (format score, incorrect range)")
+        return BASE_SCORE + FORMAT_SCORE # format score
 
     # Give reward score based on its closeness to ground truth
     target_reward = 100 if ground_truth else 0
-    score = max(
-        1 - abs(reward - target_reward) / 100,
-        0.2
-    ) # 0.2 is the minimum score since it is already getting the correct format
+    reward_diff = abs(reward - target_reward) # [0, 100]
+    # scale diff to [-1, 1], when diff > 50, it is negative
+    score = (50 - reward_diff) * 2 / 100
+    # diff = 50, score = 0
+    # diff = 0, score = 1
+    # diff = 100, score = -1
+    score += FORMAT_SCORE  # add format score
+
     if do_print:
-        print(f"Target reward: {target_reward}. Difference: {reward - target_reward}. Reward score: {score}")
+        print(f"Target reward: {target_reward}. Difference: {reward - target_reward}. Reward score (+format score 0.1): {score}")
     return score
