@@ -51,7 +51,6 @@ def test_trainer_forward_consistency(trainer: FSDPSFTTrainer, total_steps: int =
                 old_sp = trainer.config.ulysses_sequence_parallel_size
                 trainer.config.ulysses_sequence_parallel_size = 1
                 loss_ref = trainer._compute_loss_and_backward(micro_batch.copy(), do_backward=False)
-                
                 # Do SP and rmpad
                 trainer.config.ulysses_sequence_parallel_size = old_sp
                 trainer.use_remove_padding = True
