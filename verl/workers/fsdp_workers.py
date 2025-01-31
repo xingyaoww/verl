@@ -119,18 +119,23 @@ class ActorRolloutRefWorker(Worker):
         # normalize config
         if self._is_actor:
             self.config.actor.ppo_mini_batch_size //= (self.device_mesh.shape[0] // self.ulysses_sequence_parallel_size)
-            self.config.actor.ppo_micro_batch_size //= (self.device_mesh.shape[0] //
-                                                        self.ulysses_sequence_parallel_size)
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
-            self.config.actor.ppo_micro_batch_size *= self.config.rollout.n
-        if self._is_rollout:
+            # micro bsz
+            if self.config.actor.ppo_micro_batch_size is not None:
+                self.config.actor.ppo_micro_batch_size //= (self.device_mesh.shape[0] //
+                                                            self.ulysses_sequence_parallel_size)
+                self.config.actor.ppo_micro_batch_size_per_gpu = self.config.actor.ppo_micro_batch_size
+                assert self.config.actor.ppo_mini_batch_size % self.config.actor.ppo_micro_batch_size_per_gpu == 0
+        # normalize rollout config
+        if self._is_rollout and self.config.rollout.log_prob_micro_batch_size is not None:
             self.config.rollout.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
                                                                self.ulysses_sequence_parallel_size)
-            self.config.rollout.log_prob_micro_batch_size *= self.config.rollout.n
-        if self._is_ref:
+            self.config.rollout.log_prob_micro_batch_size_per_gpu = self.config.rollout.log_prob_micro_batch_size
+        # normalize ref config
+        if self._is_ref and self.config.ref.log_prob_micro_batch_size is not None:
             self.config.ref.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
                                                            self.ulysses_sequence_parallel_size)
-            self.config.ref.log_prob_micro_batch_size *= self.config.rollout.n
+            self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
     def _build_model_optimizer(self,
                                model_path,
@@ -140,6 +145,7 @@ class ActorRolloutRefWorker(Worker):
                                use_remove_padding=False,
                                enable_gradient_checkpointing=False,
                                trust_remote_code=False,
+                               use_liger=False,
                                role='actor'):
         from verl.utils.model import print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
@@ -193,6 +199,11 @@ class ActorRolloutRefWorker(Worker):
                                                                 config=actor_model_config,
                                                                 attn_implementation='flash_attention_2',
                                                                 trust_remote_code=trust_remote_code)
+            # Apply Liger kernel to the model if use_liger is set to True
+            if use_liger:
+                from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
+                _apply_liger_kernel_to_instance(model=actor_module)
+
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
 
@@ -333,6 +344,7 @@ class ActorRolloutRefWorker(Worker):
                 use_remove_padding=use_remove_padding,
                 enable_gradient_checkpointing=self.config.model.get('enable_gradient_checkpointing', False),
                 trust_remote_code=self.config.model.get('trust_remote_code', False),
+                use_liger=self.config.model.get('use_liger', False),
                 role='actor')
 
             # get the original unwrapped module
@@ -365,6 +377,7 @@ class ActorRolloutRefWorker(Worker):
                                                                use_remove_padding=use_remove_padding,
                                                                trust_remote_code=self.config.model.get(
                                                                    'trust_remote_code', False),
+                                                               use_liger=self.config.model.get('use_liger', False),
                                                                role='ref')[0]
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):
@@ -424,8 +437,6 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         prompts = prompts.to('cuda')
-        # set to False if it is validation
-        recompute_log_prob = prompts.meta_info.get('recompute_log_prob', True)
 
         assert self._is_rollout
         if self._is_offload_param:
@@ -461,18 +472,18 @@ class ActorRolloutRefWorker(Worker):
         assert self._is_actor
         data = data.to('cuda')
         # we should always recompute old_log_probs when it is HybridEngine
-        data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size
+        data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info['temperature'] = self.config.rollout.temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            old_log_probs = self.actor.compute_log_prob(data=data)
-            data.batch['old_log_probs'] = old_log_probs
-            data = self.ulysses_sharding_manager.postprocess_data(data)
+            output = self.actor.compute_log_prob(data=data)
+            output = DataProto.from_dict(tensors={'old_log_probs': output},
+                                         meta_info={'temperature': self.config.rollout.temperature})
+            output = self.ulysses_sharding_manager.postprocess_data(output)
 
-        output = data.select(batch_keys=['old_log_probs'])
         output = output.to('cpu')
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
@@ -489,7 +500,7 @@ class ActorRolloutRefWorker(Worker):
 
         data = data.to('cuda')
 
-        micro_batch_size = self.config.ref.log_prob_micro_batch_size
+        micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info['micro_batch_size'] = micro_batch_size
         data.meta_info['temperature'] = self.config.rollout.temperature
         data.meta_info['max_token_len'] = self.config.ref.log_prob_max_token_len_per_gpu
@@ -533,7 +544,7 @@ class ActorRolloutRefWorker(Worker):
             if hdfs_path is not None:
                 print(f'Uploading actor checkpoint to {hdfs_path}')
                 hdfs_io.makedirs(hdfs_path, exist_ok=True)
-                hdfs_io.copy(src=local_path, dst=hdfs_path)
+                hdfs_io.copy(src=local_path, dst=hdfs_path, dirs_exist_ok=True)
 
         torch.distributed.barrier()
         if self._is_offload_param:
@@ -573,9 +584,14 @@ class CriticWorker(Worker):
 
         # normalize config
         self.config.ppo_mini_batch_size //= (torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size)
-        self.config.ppo_micro_batch_size //= (torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size)
-        self.config.forward_micro_batch_size //= (torch.distributed.get_world_size() //
+        if self.config.ppo_micro_batch_size is not None:
+            self.config.ppo_micro_batch_size //= (torch.distributed.get_world_size() //
                                                   self.ulysses_sequence_parallel_size)
+            self.config.forward_micro_batch_size //= (torch.distributed.get_world_size() //
+                                                      self.ulysses_sequence_parallel_size)
+            self.config.ppo_micro_batch_size_per_gpu = self.config.ppo_micro_batch_size
+            self.config.forward_micro_batch_size_per_gpu = self.config.forward_micro_batch_size
+            assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu == 0
 
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary
@@ -724,7 +740,7 @@ class CriticWorker(Worker):
             load_fsdp_param_and_grad(module=self.critic_module,
                                      device_id=torch.cuda.current_device(),
                                      load_grad=self._is_offload_grad)
-        micro_batch_size = self.config.forward_micro_batch_size
+        micro_batch_size = self.config.forward_micro_batch_size_per_gpu
         data.meta_info['micro_batch_size'] = micro_batch_size
         data.meta_info['max_token_len'] = self.config.forward_max_token_len_per_gpu
         data.meta_info['use_dynamic_bsz'] = self.config.use_dynamic_bsz
@@ -838,7 +854,11 @@ class RewardModelWorker(Worker):
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
         self.use_remove_padding = self.config.model.get('use_remove_padding', False)
-        self.config.micro_batch_size //= torch.distributed.get_world_size()
+
+        # normalize config
+        if self.config.micro_batch_size is not None:
+            self.config.micro_batch_size //= torch.distributed.get_world_size()
+            self.config.micro_batch_size_per_gpu = self.config.micro_batch_size
 
     def _build_model(self, config):
         # the following line is necessary
@@ -1054,7 +1074,7 @@ class RewardModelWorker(Worker):
                 max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                 micro_batches, indices = rearrange_micro_batches(batch=rm_data.batch, max_token_len=max_token_len)
             else:
-                micro_batches = rm_data.batch.split(self.config.micro_batch_size)
+                micro_batches = rm_data.batch.split(self.config.micro_batch_size_per_gpu)
             output = []
             for micro_batch in micro_batches:
                 rm_score = self._forward_micro_batch(micro_batch)
