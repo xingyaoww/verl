@@ -79,6 +79,12 @@ veRL is fast with:
 
 .. toctree::
    :maxdepth: 1
+   :caption: Performance Tuning
+
+   perf/perf_tuning
+
+.. toctree::
+   :maxdepth: 1
    :caption: FAQ
 
    faq/faq
