@@ -40,7 +40,7 @@ def compute_score(solution_str: str, ground_truth: bool, score=1.):
         score: the score for the correct answer
     """
     do_print = random.randint(1, 32) == 1
-    SEP = "Please first provide your evaluation of the agent's overall problem-solving approach and effectiveness, then provide the reward value (integer between 0 and 100, inclusive) enclosed in <reward>...</reward> tags."
+    SEP = 'Please first analyze and provide your reasoning for the action sequence and strategy, then provide the reward value (integer between 0 and 100) enclosed in <reward>...</reward> tags.'
     solution_str = solution_str.split(SEP)[-1]
     reward, count = extract_solution(solution_str=solution_str)
 
