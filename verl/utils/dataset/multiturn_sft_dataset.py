@@ -68,38 +68,28 @@ class MultiTurnSFTDataset(Dataset):
         tokenizer = self.tokenizer
         messages = self.messages[item]
 
-        # Process each message and concatenate with special tokens
-        all_tokens = []
-        loss_mask_parts = []
-        
-        for msg in messages:
-            # Add role prefix
-            if msg['role'] == 'system':
-                prefix = "<|system|>\n"
-            elif msg['role'] == 'user':
-                prefix = "<|user|>\n"
-            elif msg['role'] == 'assistant':
-                prefix = "<|assistant|>\n"
-            else:
-                raise ValueError(f"Unknown role: {msg['role']}")
-            
-            # Tokenize the message
-            msg_str = prefix + msg['content'] + "\n"
-            msg_tokens = tokenizer(msg_str, return_tensors='pt', add_special_tokens=False)
-            msg_ids = msg_tokens['input_ids'][0]
-            
-            # Create loss mask for this message (1 for assistant responses, 0 for others)
-            msg_mask = torch.zeros_like(msg_ids, dtype=torch.long)
-            if msg['role'] == 'assistant':
-                msg_mask = torch.ones_like(msg_ids, dtype=torch.long)
-            
-            all_tokens.append(msg_ids)
-            loss_mask_parts.append(msg_mask)
-        
-        # Concatenate all tokens and masks
-        input_ids = torch.cat(all_tokens)
-        loss_mask = torch.cat(loss_mask_parts)
+        # Use the tokenizer's chat template to format and tokenize the conversation
+        tokens = tokenizer.apply_chat_template(messages, tokenize=True, return_tensors='pt', add_generation_prompt=False)
+        input_ids = tokens[0]  # The output is already a tensor
         attention_mask = torch.ones_like(input_ids)
+        
+        # Create loss mask by identifying assistant responses
+        loss_mask = torch.zeros_like(input_ids, dtype=torch.long)
+        
+        # For each assistant message, find its position in the tokenized text
+        current_tokens = []
+        for msg in messages:
+            # Tokenize this message
+            msg_tokens = tokenizer.apply_chat_template([msg], tokenize=True, return_tensors='pt', add_generation_prompt=False)
+            msg_ids = msg_tokens[0]
+            
+            # If this is an assistant message, mark its tokens in the loss mask
+            if msg['role'] == 'assistant':
+                start_idx = len(torch.cat(current_tokens)) if current_tokens else 0
+                end_idx = start_idx + len(msg_ids)
+                loss_mask[start_idx:end_idx] = 1
+            
+            current_tokens.append(msg_ids)
 
         # Handle sequence length
         sequence_length = input_ids.shape[0]

@@ -38,7 +38,7 @@ def test_multiturn_sft_dataset():
     df.to_parquet(test_file)
     
     # Initialize tokenizer and dataset
-    tokenizer = AutoTokenizer.from_pretrained('gpt2')
+    tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen2.5-Coder-7B-Instruct')
     dataset = MultiTurnSFTDataset(
         parquet_files=test_file,
         tokenizer=tokenizer,
