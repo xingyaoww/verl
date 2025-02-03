@@ -1,74 +1,119 @@
 """
-Example script for preprocessing multi-turn conversation data into parquet format
+Preprocess OpenHands SFT Trajectories dataset into parquet format for multi-turn training
 """
 
 import os
 import argparse
 import datasets
 from verl.utils.hdfs_io import copy, makedirs
+from transformers import AutoTokenizer
 
 
-def process_conversation(example, idx, split):
+def count_tokens(text, tokenizer):
+    """Count the number of tokens in a text"""
+    return len(tokenizer(text).input_ids)
+
+
+def process_conversation(example, idx, split, tokenizer, max_tokens=32000):
     """Convert a conversation into the expected format"""
     messages = []
+    total_tokens = 0
     
-    # Add system message if present
-    if example.get('system', ''):
-        messages.append({
-            "role": "system",
-            "content": example['system']
-        })
-    
-    # Add conversation turns
-    for turn in example['conversation']:
-        messages.append({
-            "role": turn['role'],
-            "content": turn['content']
-        })
-    
-    # Return the processed data
-    return {
-        "data_source": "multiturn_example",
-        "messages": messages,
-        "extra_info": {
-            'split': split,
-            'index': idx,
-            'original': example
-        }
+    # Add system message
+    system_msg = {
+        "role": "system",
+        "content": "You are a helpful assistant that can understand and generate code."
     }
+    total_tokens += count_tokens(system_msg["content"], tokenizer)
+    messages.append(system_msg)
+    
+    # Process each turn
+    for i in range(len(example['human'])):
+        # Add human message
+        human_msg = {
+            "role": "user",
+            "content": example['human'][i]
+        }
+        human_tokens = count_tokens(human_msg["content"], tokenizer)
+        
+        # Add assistant message
+        assistant_msg = {
+            "role": "assistant",
+            "content": example['assistant'][i]
+        }
+        assistant_tokens = count_tokens(assistant_msg["content"], tokenizer)
+        
+        # Check if adding these messages would exceed token limit
+        if total_tokens + human_tokens + assistant_tokens > max_tokens:
+            break
+            
+        total_tokens += human_tokens + assistant_tokens
+        messages.append(human_msg)
+        messages.append(assistant_msg)
+    
+    # Only return if we have at least one complete turn
+    if len(messages) >= 3:  # system + at least one human-assistant pair
+        return {
+            "data_source": "openhands_sft_trajectories",
+            "messages": messages,
+            "extra_info": {
+                'split': split,
+                'index': idx,
+                'total_tokens': total_tokens,
+                'original_id': example.get('id', None)
+            }
+        }
+    return None
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--local_dir', default='~/data/multiturn')
     parser.add_argument('--hdfs_dir', default=None)
+    parser.add_argument('--max_tokens', type=int, default=32000)
     
     args = parser.parse_args()
     
-    # Load your dataset here
-    # This is just an example - replace with your actual data loading
-    dataset = datasets.load_dataset('your_dataset_name')
+    # Load tokenizer for token counting
+    tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct')
     
+    # Load OpenHands dataset
+    dataset = datasets.load_dataset('SWE-Gym/OpenHands-SFT-Trajectories')
+    
+    # Split into train/test (90/10 split)
+    dataset = dataset['train'].train_test_split(test_size=0.1, seed=42)
     train_dataset = dataset['train']
     test_dataset = dataset['test']
     
     # Process the datasets
     train_dataset = train_dataset.map(
-        function=lambda x, i: process_conversation(x, i, 'train'),
-        with_indices=True
+        function=lambda x, i: process_conversation(x, i, 'train', tokenizer, args.max_tokens),
+        with_indices=True,
+        remove_columns=train_dataset.column_names
     )
     test_dataset = test_dataset.map(
-        function=lambda x, i: process_conversation(x, i, 'test'),
-        with_indices=True
+        function=lambda x, i: process_conversation(x, i, 'test', tokenizer, args.max_tokens),
+        with_indices=True,
+        remove_columns=test_dataset.column_names
     )
     
-    # Save to parquet files
-    local_dir = args.local_dir
-    hdfs_dir = args.hdfs_dir
+    # Filter out None values (conversations that were too long)
+    train_dataset = train_dataset.filter(lambda x: x is not None)
+    test_dataset = test_dataset.filter(lambda x: x is not None)
     
+    # Create output directory
+    local_dir = os.path.expanduser(args.local_dir)
+    os.makedirs(local_dir, exist_ok=True)
+    
+    # Save to parquet files
     train_dataset.to_parquet(os.path.join(local_dir, 'train.parquet'))
     test_dataset.to_parquet(os.path.join(local_dir, 'test.parquet'))
     
-    if hdfs_dir is not None:
-        makedirs(hdfs_dir)
-        copy(src=local_dir, dst=hdfs_dir)
+    if args.hdfs_dir is not None:
+        makedirs(args.hdfs_dir)
+        copy(src=local_dir, dst=args.hdfs_dir)
+    
+    # Print statistics
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Test dataset size: {len(test_dataset)}")
+    print(f"Data saved to {local_dir}")
