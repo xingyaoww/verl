@@ -1,0 +1,49 @@
+name: Unit Tests
+
+on:
+  # Trigger the workflow on push or pull request,
+  # but only for the main branch
+  push:
+    branches:
+      - main
+    paths:
+      - "**/*.py"
+      - .github/workflows/unit_tests.yml
+      - "tests/soft/*.py"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "**/*.py"
+      - .github/workflows/unit_tests.yml
+      - "tests/soft/*.py"
+
+jobs:
+  unit_tests:
+    runs-on: ubuntu-latest
+    container:
+      image: verlai/verl:vemlp-th2.4.0-cu124-vllm0.6.3-ray2.10-te1.7-v0.0.3
+      options: --gpus all --shm-size=10g
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Install dependencies
+        run: |
+          pip3 install -e .[test]
+          pip3 install pytest pytest-cov
+      
+      - name: Run unit tests
+        run: |
+          pytest tests/soft/ -v --cov=verl --cov-report=xml
+      
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v3
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: true
