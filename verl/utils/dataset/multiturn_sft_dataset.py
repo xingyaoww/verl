@@ -68,28 +68,31 @@ class MultiTurnSFTDataset(Dataset):
         tokenizer = self.tokenizer
         messages = self.messages[item]
 
-        # Use the tokenizer's chat template to format and tokenize the conversation
-        tokens = tokenizer.apply_chat_template(messages, tokenize=True, return_tensors='pt', add_generation_prompt=False)
-        input_ids = tokens[0]  # The output is already a tensor
+        # First, get the full conversation tokens
+        full_tokens = tokenizer.apply_chat_template(messages, tokenize=True, return_tensors='pt', add_generation_prompt=False)
+        input_ids = full_tokens[0]  # The output is already a tensor
         attention_mask = torch.ones_like(input_ids)
         
         # Create loss mask by identifying assistant responses
         loss_mask = torch.zeros_like(input_ids, dtype=torch.long)
         
-        # For each assistant message, find its position in the tokenized text
-        current_tokens = []
-        for msg in messages:
-            # Tokenize this message
-            msg_tokens = tokenizer.apply_chat_template([msg], tokenize=True, return_tensors='pt', add_generation_prompt=False)
-            msg_ids = msg_tokens[0]
+        # Process each message to find assistant responses
+        current_length = 0
+        for i, msg in enumerate(messages):
+            # Get tokens for messages up to this point to find the start position
+            prefix_messages = messages[:i+1]
+            prefix_tokens = tokenizer.apply_chat_template(prefix_messages, tokenize=True, return_tensors='pt', add_generation_prompt=False)
             
-            # If this is an assistant message, mark its tokens in the loss mask
+            # Get tokens for messages up to previous point
+            prev_tokens = tokenizer.apply_chat_template(messages[:i], tokenize=True, return_tensors='pt', add_generation_prompt=False) if i > 0 else None
+            
+            # Calculate start and end positions
+            start_pos = prev_tokens[0].shape[0] if prev_tokens is not None else 0
+            end_pos = prefix_tokens[0].shape[0]
+            
+            # If this is an assistant message, set loss mask
             if msg['role'] == 'assistant':
-                start_idx = len(torch.cat(current_tokens)) if current_tokens else 0
-                end_idx = start_idx + len(msg_ids)
-                loss_mask[start_idx:end_idx] = 1
-            
-            current_tokens.append(msg_ids)
+                loss_mask[start_pos:end_pos] = 1
 
         # Handle sequence length
         sequence_length = input_ids.shape[0]
@@ -120,7 +123,10 @@ class MultiTurnSFTDataset(Dataset):
             else:
                 raise ValueError(f'Unknown truncation method {self.truncation}')
 
-        position_ids = compute_position_id_with_mask(attention_mask)
+        # Create position IDs
+        position_ids = torch.arange(len(input_ids), dtype=torch.long)
+        # Zero out position IDs for padding
+        position_ids = position_ids * attention_mask
 
         return {
             'input_ids': input_ids,
