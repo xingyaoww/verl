@@ -1,4 +1,3 @@
-
 Performance Tuning Guide
 =========================
 
@@ -124,7 +123,7 @@ We support different model utilize different ulysses_sequence_parallel_size size
 To train log sequence (>32k), users may need to decrease the ``*micro_batch_size_per_gpu`` and ``*max_token_len_per_gpu`` to avoid OOM.
 
 LigerKernel for SFT
-------------------
+----------------------
 
 LigerKernel is a high-performance kernel for Supervised Fine-Tuning (SFT) that can improve training efficiency. To enable LigerKernel in your SFT training:
 
