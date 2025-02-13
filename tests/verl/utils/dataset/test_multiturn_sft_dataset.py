@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """
 Test the MultiTurnSFTDataset implementation
 """
@@ -193,7 +192,9 @@ def test_multiturn_sft_dataset():
         "Loss mask not set correctly for padding"
 
     print("All tests passed!")
-EOF > tests/verl/utils/dataset/test_multiturn_sft_dataset.py
+
+
+EOF > tests / verl / utils / dataset / test_multiturn_sft_dataset.py
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -207,7 +208,6 @@ EOF > tests/verl/utils/dataset/test_multiturn_sft_dataset.py
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """
 Test the MultiTurnSFTDataset implementation
 """

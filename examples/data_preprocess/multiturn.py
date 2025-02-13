@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """
 Preprocess OpenHands SFT Trajectories dataset into parquet format for multi-turn training
 """
@@ -120,7 +119,7 @@ if __name__ == '__main__':
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Test dataset size: {len(test_dataset)}")
     print(f"Data saved to {local_dir}")
-EOF > examples/data_preprocess/multiturn.py
+EOF > examples / data_preprocess / multiturn.py
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -134,7 +133,6 @@ EOF > examples/data_preprocess/multiturn.py
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """
 Preprocess OpenHands SFT Trajectories dataset into parquet format for multi-turn training
 """

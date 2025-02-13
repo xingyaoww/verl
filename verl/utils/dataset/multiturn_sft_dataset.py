@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """
 Multi-turn SFT dataset that supports training on conversation data with multiple turns
 """
@@ -155,7 +154,9 @@ class MultiTurnSFTDataset(Dataset):
             'position_ids': position_ids,
             'loss_mask': loss_mask
         }
-EOF > verl/utils/dataset/multiturn_sft_dataset.py
+
+
+EOF > verl / utils / dataset / multiturn_sft_dataset.py
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -169,7 +170,6 @@ EOF > verl/utils/dataset/multiturn_sft_dataset.py
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """
 Multi-turn SFT dataset that supports training on conversation data with multiple turns
 """
