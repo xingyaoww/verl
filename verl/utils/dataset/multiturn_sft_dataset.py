@@ -19,12 +19,13 @@ class MultiTurnSFTDataset(Dataset):
     Dataset for multi-turn conversations where each assistant response should be trained
     """
 
-    def __init__(self,
-                 parquet_files: Union[str, List[str]],
-                 tokenizer,
-                 messages_key='messages',  # Key for the messages list in the parquet file
-                 max_length=1024,
-                 truncation='error'):
+    def __init__(
+            self,
+            parquet_files: Union[str, List[str]],
+            tokenizer,
+            messages_key='messages',  # Key for the messages list in the parquet file
+            max_length=1024,
+            truncation='error'):
         assert truncation in ['error', 'left', 'right']
         self.truncation = truncation
 
@@ -46,6 +47,7 @@ class MultiTurnSFTDataset(Dataset):
             self.parquet_files[i] = copy_local_path_from_hdfs(parquet_file, verbose=True)
 
     def _read_files_and_process(self):
+
         def series_to_item(ls):
             import pandas, numpy
             while isinstance(ls, (pandas.core.series.Series, numpy.ndarray)) and len(ls) == 1:
@@ -57,7 +59,7 @@ class MultiTurnSFTDataset(Dataset):
             dataframe = pd.read_parquet(parquet_file)
             dataframes.append(dataframe)
         self.dataframe = pd.concat(dataframes)
-        
+
         # Extract messages list from dataframe
         self.messages = self.dataframe[self.messages_key].apply(series_to_item).tolist()
 
@@ -69,27 +71,34 @@ class MultiTurnSFTDataset(Dataset):
         messages = self.messages[item]
 
         # First, get the full conversation tokens
-        full_tokens = tokenizer.apply_chat_template(messages, tokenize=True, return_tensors='pt', add_generation_prompt=False)
+        full_tokens = tokenizer.apply_chat_template(messages,
+                                                    tokenize=True,
+                                                    return_tensors='pt',
+                                                    add_generation_prompt=False)
         input_ids = full_tokens[0]  # The output is already a tensor
         attention_mask = torch.ones_like(input_ids)
-        
+
         # Create loss mask by identifying assistant responses
         loss_mask = torch.zeros_like(input_ids, dtype=torch.long)
-        
+
         # Process each message to find assistant responses
         current_length = 0
         for i, msg in enumerate(messages):
             # Get tokens for messages up to this point to find the start position
-            prefix_messages = messages[:i+1]
-            prefix_tokens = tokenizer.apply_chat_template(prefix_messages, tokenize=True, return_tensors='pt', add_generation_prompt=False)
-            
+            prefix_messages = messages[:i + 1]
+            prefix_tokens = tokenizer.apply_chat_template(prefix_messages,
+                                                          tokenize=True,
+                                                          return_tensors='pt',
+                                                          add_generation_prompt=False)
+
             # Get tokens for messages up to previous point
-            prev_tokens = tokenizer.apply_chat_template(messages[:i], tokenize=True, return_tensors='pt', add_generation_prompt=False) if i > 0 else None
-            
+            prev_tokens = tokenizer.apply_chat_template(
+                messages[:i], tokenize=True, return_tensors='pt', add_generation_prompt=False) if i > 0 else None
+
             # Calculate start and end positions
             start_pos = prev_tokens[0].shape[0] if prev_tokens is not None else 0
             end_pos = prefix_tokens[0].shape[0]
-            
+
             # If this is an assistant message, set loss mask
             if msg['role'] == 'assistant':
                 loss_mask[start_pos:end_pos] = 1
@@ -100,11 +109,9 @@ class MultiTurnSFTDataset(Dataset):
             # Pad sequences
             pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
             padded_input_ids = torch.ones(size=(self.max_length - sequence_length,),
-                                        dtype=input_ids.dtype) * pad_token_id
-            padded_attention_mask = torch.zeros(size=(self.max_length - sequence_length,), 
-                                              dtype=attention_mask.dtype)
-            padded_loss_mask = torch.zeros(size=(self.max_length - sequence_length,), 
-                                         dtype=loss_mask.dtype)
+                                          dtype=input_ids.dtype) * pad_token_id
+            padded_attention_mask = torch.zeros(size=(self.max_length - sequence_length,), dtype=attention_mask.dtype)
+            padded_loss_mask = torch.zeros(size=(self.max_length - sequence_length,), dtype=loss_mask.dtype)
 
             input_ids = torch.cat((input_ids, padded_input_ids))
             attention_mask = torch.cat((attention_mask, padded_attention_mask))

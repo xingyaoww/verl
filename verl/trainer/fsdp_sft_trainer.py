@@ -123,45 +123,37 @@ class FSDPSFTTrainer(object):
         config = self.config
         # build dataset
         dataset_class = MultiTurnSFTDataset if config.data.get('use_multiturn', False) else SFTDataset
-        
+
         if dataset_class == MultiTurnSFTDataset:
             # Multi-turn dataset uses messages_key instead of prompt/response keys
-            self.train_dataset = dataset_class(
-                parquet_files=config.data.train_files,
-                tokenizer=self.tokenizer,
-                messages_key=config.data.messages_key,
-                max_length=config.data.max_length,
-                truncation=config.data.truncation
-            )
-            self.val_dataset = dataset_class(
-                parquet_files=config.data.val_files,
-                tokenizer=self.tokenizer,
-                messages_key=config.data.messages_key,
-                max_length=config.data.max_length,
-                truncation=config.data.truncation
-            )
+            self.train_dataset = dataset_class(parquet_files=config.data.train_files,
+                                               tokenizer=self.tokenizer,
+                                               messages_key=config.data.messages_key,
+                                               max_length=config.data.max_length,
+                                               truncation=config.data.truncation)
+            self.val_dataset = dataset_class(parquet_files=config.data.val_files,
+                                             tokenizer=self.tokenizer,
+                                             messages_key=config.data.messages_key,
+                                             max_length=config.data.max_length,
+                                             truncation=config.data.truncation)
         else:
             # Single-turn dataset uses prompt/response keys
-            self.train_dataset = dataset_class(
-                parquet_files=config.data.train_files,
-                tokenizer=self.tokenizer,
-                prompt_key=config.data.prompt_key,
-                prompt_dict_keys=config.data.get('prompt_dict_keys', None),
-                response_key=config.data.response_key,
-                response_dict_keys=config.data.get('response_dict_keys', None),
-                max_length=config.data.max_length,
-                truncation=config.data.truncation
-            )
-            self.val_dataset = dataset_class(
-                parquet_files=config.data.val_files,
-                tokenizer=self.tokenizer,
-                prompt_key=config.data.prompt_key,
-                prompt_dict_keys=config.data.get('prompt_dict_keys', None),
-                response_key=config.data.response_key,
-                response_dict_keys=config.data.get('response_dict_keys', None),
-                max_length=config.data.max_length,
-                truncation=config.data.truncation
-            )
+            self.train_dataset = dataset_class(parquet_files=config.data.train_files,
+                                               tokenizer=self.tokenizer,
+                                               prompt_key=config.data.prompt_key,
+                                               prompt_dict_keys=config.data.get('prompt_dict_keys', None),
+                                               response_key=config.data.response_key,
+                                               response_dict_keys=config.data.get('response_dict_keys', None),
+                                               max_length=config.data.max_length,
+                                               truncation=config.data.truncation)
+            self.val_dataset = dataset_class(parquet_files=config.data.val_files,
+                                             tokenizer=self.tokenizer,
+                                             prompt_key=config.data.prompt_key,
+                                             prompt_dict_keys=config.data.get('prompt_dict_keys', None),
+                                             response_key=config.data.response_key,
+                                             response_dict_keys=config.data.get('response_dict_keys', None),
+                                             max_length=config.data.max_length,
+                                             truncation=config.data.truncation)
 
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
