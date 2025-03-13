@@ -31,7 +31,7 @@
 
 # -- Project information -----------------------------------------------------
 
-project = u'veRL'
+project = u'verl'
 # pylint: disable=W0622
 copyright = u'2024 ByteDance Seed Foundation MLSys Team'
 author = u'Guangming Sheng, Chi Zhang, Yanghua Peng, Haibin Lin'
@@ -45,6 +45,8 @@ master_doc = 'index'
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = ['recommonmark',
+  'sphinx.ext.autodoc',
+  'sphinx.ext.autosummary',
   'sphinx.ext.autosectionlabel',
 ]
 

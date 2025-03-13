@@ -14,83 +14,38 @@
 """
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
-
-from verl import DataProto
-import torch
-from verl.utils.reward_score import gsm8k, math
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-
-
-def _default_compute_score(data_source, solution_str, ground_truth):
-    if data_source == 'openai/gsm8k':
-        return gsm8k.compute_score(solution_str, ground_truth)
-    elif data_source in ['lighteval/MATH', 'DigitalLearningGmbH/MATH-lighteval']:
-        return math.compute_score(solution_str, ground_truth)
-    else:
-        raise NotImplementedError
-
-
-class RewardManager():
-    """The reward manager.
-    """
-
-    def __init__(self, tokenizer, num_examine, compute_score=None) -> None:
-        self.tokenizer = tokenizer
-        self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
-        self.compute_score = compute_score or _default_compute_score
-
-    def __call__(self, data: DataProto):
-        """We will expand this function gradually based on the available datasets"""
-
-        # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if 'rm_scores' in data.batch.keys():
-            return data.batch['rm_scores']
-
-        reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
-
-        already_print_data_sources = {}
-
-        for i in range(len(data)):
-            data_item = data[i]  # DataProtoItem
-
-            prompt_ids = data_item.batch['prompts']
-
-            prompt_length = prompt_ids.shape[-1]
-
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
-
-            response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-
-            # decode
-            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
-            sequences_str = self.tokenizer.decode(sequences)
-
-            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
-
-            data_source = data_item.non_tensor_batch['data_source']
-
-            score = self.compute_score(
-                data_source=data_source,
-                solution_str=sequences_str,
-                ground_truth=ground_truth,
-            )
-            reward_tensor[i, valid_response_length - 1] = score
-
-            if data_source not in already_print_data_sources:
-                already_print_data_sources[data_source] = 0
-
-            if already_print_data_sources[data_source] < self.num_examine:
-                already_print_data_sources[data_source] += 1
-                print(sequences_str)
-
-        return reward_tensor
-
 
 import ray
 import hydra
+
+
+def get_custom_reward_fn(config):
+    import importlib.util, os
+
+    reward_fn_config = config.get("custom_reward_function") or {}
+    file_path = reward_fn_config.get("path")
+    if not file_path:
+        return None
+
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Reward function file '{file_path}' not found.")
+
+    spec = importlib.util.spec_from_file_location("custom_module", file_path)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as e:
+        raise RuntimeError(f"Error loading module from '{file_path}': {e}")
+
+    function_name = reward_fn_config.get("name")
+
+    if not hasattr(module, function_name):
+        raise AttributeError(f"Reward function '{function_name}' not found in '{file_path}'.")
+
+    print(f"using customized reward function '{function_name}' from '{file_path}'")
+
+    return getattr(module, function_name)
 
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
@@ -98,19 +53,24 @@ def main(config):
     run_ppo(config)
 
 
-def run_ppo(config, compute_score=None):
+def run_ppo(config) -> None:
+
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray.init(runtime_env={
+            'env_vars': {
+                'TOKENIZERS_PARALLELISM': 'true',
+                'NCCL_DEBUG': 'WARN',
+                'VLLM_LOGGING_LEVEL': 'WARN'
+            }
+        })
 
-    ray.get(main_task.remote(config, compute_score))
+    ray.get(main_task.remote(config))
 
 
-@ray.remote
-def main_task(config, compute_score=None):
-    from verl.utils.fs import copy_local_path_from_hdfs
-    from transformers import AutoTokenizer
-
+@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
+def main_task(config):
+    from verl.utils.fs import copy_to_local
     # print initial config
     from pprint import pprint
     from omegaconf import OmegaConf
@@ -118,11 +78,12 @@ def main_task(config, compute_score=None):
     OmegaConf.resolve(config)
 
     # download the checkpoint from hdfs
-    local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
+    local_path = copy_to_local(config.actor_rollout_ref.model.path)
 
     # instantiate tokenizer
-    from verl.utils import hf_tokenizer
+    from verl.utils import hf_tokenizer, hf_processor
     tokenizer = hf_tokenizer(local_path)
+    processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
 
     # define worker classes
     if config.actor_rollout_ref.actor.strategy == 'fsdp':
@@ -174,15 +135,27 @@ def main_task(config, compute_score=None):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
-    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
+    reward_manager_name = config.reward_model.get("reward_manager", "naive")
+    if reward_manager_name == 'naive':
+        from verl.workers.reward_manager import NaiveRewardManager
+        reward_manager_cls = NaiveRewardManager
+    elif reward_manager_name == 'prime':
+        from verl.workers.reward_manager import PrimeRewardManager
+        reward_manager_cls = PrimeRewardManager
+    else:
+        raise NotImplementedError
+
+    compute_score = get_custom_reward_fn(config)
+    reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
 
     # Note that we always use function-based RM for validation
-    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
+    val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
     trainer = RayPPOTrainer(config=config,
                             tokenizer=tokenizer,
+                            processor=processor,
                             role_worker_mapping=role_worker_mapping,
                             resource_pool_manager=resource_pool_manager,
                             ray_worker_group_cls=ray_worker_group_cls,
