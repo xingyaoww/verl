@@ -241,12 +241,12 @@ class FSDPRMTrainer(FSDPSFTTrainer):
         loss_mask = batch.pop('loss_mask')[:, :-1].reshape(-1).cuda()
         returns = batch.pop('returns').cuda()
 
-        print("===== Training step inputs =====")
-        print(f'{loss_mask.shape=}, {loss_mask=}')
-        print(f'{returns.shape=}, {returns=}')
-        print(f'{input_ids.shape=}, {input_ids=}')
-        print(f'{attention_mask.shape=}, {attention_mask=}')
-        print(f'{position_ids.shape=}, {position_ids=}')
+        # print("===== Training step inputs =====")
+        # print(f'{loss_mask.shape=}, {loss_mask=}')
+        # print(f'{returns.shape=}, {returns=}')
+        # print(f'{input_ids.shape=}, {input_ids=}')
+        # print(f'{attention_mask.shape=}, {attention_mask=}')
+        # print(f'{position_ids.shape=}, {position_ids=}')
 
         # Context manager for sequence parallel if needed
         context = self.sharding_manager if use_sp else nullcontext()
