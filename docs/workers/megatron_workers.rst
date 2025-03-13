@@ -3,7 +3,7 @@ Megatron-LM Backend
 
 We support Megatron Backend by implementing various workers for actor,
 critic, reference, rollout and reward models. We also implement the
-``3DHybridEngine`` using Megatron-LM and vLLM in `megatron_vllm.py <https://github.com/volcengine/verl/blob/main/verl/trainer/ppo/hybrid_engine/megatron_vllm.py>`_.
+``3DHybridEngine`` using Megatron-LM and vLLM in `megatron_vllm.py <https://github.com/volcengine/verl/blob/main/verl/workers/sharding_manager/megatron_vllm.py>`_.
 
 **Pros**
 
@@ -76,7 +76,7 @@ highlighted below:
 4. ``MegatronVLLMShardingManager`` a context manager to perform actual
    resharding between actor and rollout.
 
-See `source code <https://github.com/volcengine/verl/blob/main/verl/trainer/ppo/workers/megatron_workers.py#L63>`_ for more information.
+See `source code <https://github.com/volcengine/verl/blob/main/verl/workers/megatron_workers.py#L63>`_ for more information.
 
 .. code:: python
 
@@ -130,7 +130,7 @@ See `source code <https://github.com/volcengine/verl/blob/main/verl/trainer/ppo/
 
 - In this function, the rollout model will perform auto-regressive
   generation and the actor model will recompute the old log prob for the
-  generetad response.
+  generated response.
 
 3. Update actor model
 
@@ -196,5 +196,6 @@ additional initialization for the Optimizer.
 Context Parallel
 ----------------
 
-This require the developer/contributor to implement the context parallel
-both in Megatron-LM and models.
+Currently we can only use LLaMa and Qwen models implemented in verl, and context parallel is not supported by far.
+
+We are working in progress to support Megatron implementation of GPTModel, with TransformerEngine support. So if the itegration goes well, we can support Ulysses, Ring and AllGather context parallel in the future.
