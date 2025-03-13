@@ -103,7 +103,7 @@ class FSDPRMTrainer(FSDPSFTTrainer):
         self.train_dataloader = DataLoader(dataset=self.train_dataset,
                                            batch_size=config.data.train_batch_size,
                                            sampler=self.train_sampler,
-                                           num_workers=1,
+                                           num_workers=8,
                                            pin_memory=True,
                                            drop_last=True)
 
@@ -115,7 +115,7 @@ class FSDPRMTrainer(FSDPSFTTrainer):
         self.val_dataloader = DataLoader(dataset=self.val_dataset,
                                          batch_size=config.data.micro_batch_size_per_gpu,
                                          sampler=self.val_sampler,
-                                         num_workers=1,
+                                         num_workers=8,
                                          pin_memory=True,
                                          drop_last=True)
 
