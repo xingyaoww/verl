@@ -108,6 +108,8 @@ class FSDPSFTTrainer(object):
         if self.device_mesh.get_rank() == 0:
             print(self.config)
 
+        self.auto_model_class = AutoModelForCausalLM
+
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
         if self.device_mesh.get_rank() == 0:
@@ -225,7 +227,7 @@ class FSDPSFTTrainer(object):
                                                        mesh=self.device_mesh)
 
         with init_context():
-            self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(local_model_path,
+            self.model: PreTrainedModel = self.auto_model_class.from_pretrained(local_model_path,
                                                                                config=config,
                                                                                torch_dtype=torch.float32,
                                                                                attn_implementation='flash_attention_2',
