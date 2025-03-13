@@ -55,6 +55,7 @@ class MultiTurnSFTDataset(Dataset):
         if isinstance(tokenizer, str):
             tokenizer = hf_tokenizer(tokenizer)
         self.tokenizer: PreTrainedTokenizer = tokenizer
+        self.tokenizer.model_max_length = max_length
         self.messages_key = messages_key
         self.max_length = max_length
 
