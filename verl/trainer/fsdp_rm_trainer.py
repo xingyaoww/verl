@@ -153,7 +153,7 @@ class FSDPRMTrainer(FSDPSFTTrainer):
                                                        mesh=self.device_mesh)
 
         # Perform RoPE scaling when self.config.model.rope_scaling is not None
-        from verl.utils.model import print_model_size, update_model_config
+        from verl.utils.model import update_model_config
         override_config_kwargs = {}
         if 'rope_scaling' in self.config.model and self.config.model.rope_scaling is not None:
             override_config_kwargs['rope_scaling'] = dict(self.config.model.rope_scaling)
