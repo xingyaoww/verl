@@ -532,7 +532,7 @@ def get_wsd_schedule_with_warmup(
     min_lr_ratio: float = 0.0,
     num_cycles: float = 0.5,
     last_epoch: int = -1,
-    stable_ratio: float = 0.0,
+    stable_ratio: float = 0.9,
 ):
     """
     Create a Warmup-Stable-Decay learning rate scheduler.
