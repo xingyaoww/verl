@@ -32,7 +32,7 @@ from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, CPUOffload
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, AutoConfig
-from verl.utils.torch_functional import get_cosine_schedule_with_warmup
+from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
 from tensordict import TensorDict
 from torch.utils.data import DataLoader, DistributedSampler
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
@@ -42,7 +42,7 @@ from verl.utils.dataset import SFTDataset
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.fs import copy_to_local
 from verl.utils.tracking import Tracking
-from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, set_ulysses_sequence_parallel_group
+from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size
 from torch.distributed.device_mesh import DeviceMesh
 
 import verl.utils.hdfs_io as hdfs_io
@@ -308,9 +308,16 @@ class FSDPSFTTrainer(object):
 
         num_warmup_steps = int(self.total_steps * self.config.optim.warmup_steps_ratio)
 
-        self.lr_scheduler = get_cosine_schedule_with_warmup(optimizer=self.optimizer,
+        if self.config.optim.lr_scheduler == 'cosine':
+            self.lr_scheduler = get_cosine_schedule_with_warmup(optimizer=self.optimizer,
+                                                                num_warmup_steps=num_warmup_steps,
+                                                                num_training_steps=self.total_steps)
+        elif self.config.optim.lr_scheduler == 'wsd':
+            self.lr_scheduler = get_wsd_schedule_with_warmup(optimizer=self.optimizer,
                                                             num_warmup_steps=num_warmup_steps,
                                                             num_training_steps=self.total_steps)
+        else:
+            raise ValueError(f'Unknown lr scheduler: {self.config.optim.lr_scheduler}')
 
     def _compute_loss_and_backward(self, batch, do_backward=True):
         """Compute loss with optional sequence parallelism and remove padding features"""
