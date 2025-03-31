@@ -122,38 +122,25 @@ class FSDPSFTTrainer(object):
     def _build_dataloader(self):
         config = self.config
         # build dataset
-        dataset_class = MultiTurnSFTDataset if config.data.get('use_multiturn', False) else SFTDataset
-
-        if dataset_class == MultiTurnSFTDataset:
-            # Multi-turn dataset uses messages_key instead of prompt/response keys
-            self.train_dataset = dataset_class(parquet_files=config.data.train_files,
-                                               tokenizer=self.tokenizer,
-                                               messages_key=config.data.messages_key,
-                                               max_length=config.data.max_length,
-                                               truncation=config.data.truncation)
-            self.val_dataset = dataset_class(parquet_files=config.data.val_files,
-                                             tokenizer=self.tokenizer,
-                                             messages_key=config.data.messages_key,
-                                             max_length=config.data.max_length,
-                                             truncation=config.data.truncation)
+        from verl.utils.import_utils import load_extern_type
+        
+        # First check if a custom dataset class is specified
+        if config.data.custom_cls.get("path", None):
+            dataset_cls = load_extern_type(config.data.custom_cls.path, config.data.custom_cls.name)
+        # Then check if multi-turn dataset should be used
+        elif config.data.get('use_multiturn', False):
+            dataset_cls = MultiTurnSFTDataset
+        # Default to single-turn dataset
         else:
-            # Single-turn dataset uses prompt/response keys
-            self.train_dataset = dataset_class(parquet_files=config.data.train_files,
-                                               tokenizer=self.tokenizer,
-                                               prompt_key=config.data.prompt_key,
-                                               prompt_dict_keys=config.data.get('prompt_dict_keys', None),
-                                               response_key=config.data.response_key,
-                                               response_dict_keys=config.data.get('response_dict_keys', None),
-                                               max_length=config.data.max_length,
-                                               truncation=config.data.truncation)
-            self.val_dataset = dataset_class(parquet_files=config.data.val_files,
-                                             tokenizer=self.tokenizer,
-                                             prompt_key=config.data.prompt_key,
-                                             prompt_dict_keys=config.data.get('prompt_dict_keys', None),
-                                             response_key=config.data.response_key,
-                                             response_dict_keys=config.data.get('response_dict_keys', None),
-                                             max_length=config.data.max_length,
-                                             truncation=config.data.truncation)
+            dataset_cls = SFTDataset
+            
+        # Create datasets based on the selected class
+        self.train_dataset = dataset_cls(parquet_files=config.data.train_files,
+                                         tokenizer=self.tokenizer,
+                                         config=config.data)
+        self.val_dataset = dataset_cls(parquet_files=config.data.val_files,
+                                       tokenizer=self.tokenizer,
+                                       config=config.data)
 
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
