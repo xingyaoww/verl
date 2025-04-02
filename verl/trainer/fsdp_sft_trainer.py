@@ -128,7 +128,7 @@ class FSDPSFTTrainer(object):
         if config.data.custom_cls.get("path", None):
             dataset_cls = load_extern_type(config.data.custom_cls.path, config.data.custom_cls.name)
         # Then check if multi-turn dataset should be used
-        elif config.data.get('use_multiturn', False):
+        elif config.data.get('multiturn', {}).get('enable', False):
             dataset_cls = MultiTurnSFTDataset
         # Default to single-turn dataset
         else:
