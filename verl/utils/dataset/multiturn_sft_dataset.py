@@ -36,22 +36,20 @@ class MultiTurnSFTDataset(Dataset):
             self,
             parquet_files: Union[str, List[str]],
             tokenizer,
-            config=None,
-            messages_key='messages',  # Key for the messages list in the parquet file
-            max_length=1024,
-            truncation='error'):
-        assert truncation in ['error', 'left', 'right']
+            config=None):
+        # Set default values
+        self.truncation = 'error'
+        self.max_length = 1024
+        self.messages_key = 'messages'
         
         # Extract parameters from config if provided
         if config is not None:
-            self.truncation = config.get('truncation', truncation)
-            self.max_length = config.get('max_length', max_length)
+            self.truncation = config.get('truncation', self.truncation)
+            self.max_length = config.get('max_length', self.max_length)
             # Get messages_key from the new multiturn config structure
-            self.messages_key = config.get('multiturn', {}).get('messages_key', messages_key)
-        else:
-            self.truncation = truncation
-            self.max_length = max_length
-            self.messages_key = messages_key
+            self.messages_key = config.get('multiturn', {}).get('messages_key', self.messages_key)
+            
+        assert self.truncation in ['error', 'left', 'right']
 
         if not isinstance(parquet_files, List):
             parquet_files = [parquet_files]
