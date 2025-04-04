@@ -175,11 +175,7 @@ def test_multiturn_sft_dataset():
 
     # Test 10: Verify padding behavior
     padding_config = {'max_length': 1024, 'truncation': 'error', 'multiturn': {'messages_key': 'messages'}}
-    small_dataset = MultiTurnSFTDataset(
-        parquet_files=test_file,
-        tokenizer=tokenizer,
-        config=padding_config
-    )
+    small_dataset = MultiTurnSFTDataset(parquet_files=test_file, tokenizer=tokenizer, config=padding_config)
     padded_item = small_dataset[0]
 
     # Get actual sequence length (before padding)

@@ -123,7 +123,7 @@ class FSDPSFTTrainer(object):
         config = self.config
         # build dataset
         from verl.utils.import_utils import load_extern_type
-        
+
         # First check if a custom dataset class is specified
         if config.data.custom_cls.get("path", None):
             dataset_cls = load_extern_type(config.data.custom_cls.path, config.data.custom_cls.name)
@@ -133,7 +133,7 @@ class FSDPSFTTrainer(object):
         # Default to single-turn dataset
         else:
             dataset_cls = SFTDataset
-            
+
         # Create datasets based on the selected class
         self.train_dataset = dataset_cls(parquet_files=config.data.train_files,
                                          tokenizer=self.tokenizer,
