@@ -18,7 +18,6 @@ Multi-turn SFT dataset that supports training on conversation data with multiple
 from typing import List, Union
 
 import pandas as pd
-import numpy as np
 import torch
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
@@ -27,26 +26,22 @@ from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils import hf_tokenizer
 
-def series_to_item(ls):
-    while isinstance(ls, (pd.core.series.Series, np.ndarray)) and len(ls) == 1:
-        ls = ls[0]
-    return ls
-
 
 class MultiTurnSFTDataset(Dataset):
     """
     Dataset for multi-turn conversations where each assistant response should be trained
     """
 
-    def __init__(
-            self,
-            parquet_files: Union[str, List[str]],
-            tokenizer,
-            messages_key='messages',  # Key for the messages list in the parquet file
-            max_length=1024,
-            truncation='error'):
-        assert truncation in ['error', 'left', 'right']
-        self.truncation = truncation
+    def __init__(self, parquet_files: Union[str, List[str]], tokenizer, config=None):
+        # Set defaults and extract parameters from config if provided
+        config = config or {}
+        self.truncation = config.get('truncation', 'error')
+        self.max_length = config.get('max_length', 1024)
+        # Get messages_key from the new multiturn config structure
+        multiturn_config = config.get('multiturn', {})
+        self.messages_key = multiturn_config.get('messages_key', 'messages')
+
+        assert self.truncation in ['error', 'left', 'right']
 
         if not isinstance(parquet_files, List):
             parquet_files = [parquet_files]
@@ -55,9 +50,6 @@ class MultiTurnSFTDataset(Dataset):
         if isinstance(tokenizer, str):
             tokenizer = hf_tokenizer(tokenizer)
         self.tokenizer: PreTrainedTokenizer = tokenizer
-        self.tokenizer.model_max_length = max_length
-        self.messages_key = messages_key
-        self.max_length = max_length
 
         self._download()
         self._read_files_and_process()

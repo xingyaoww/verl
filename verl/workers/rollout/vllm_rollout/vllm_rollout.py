@@ -33,7 +33,7 @@ from tensordict import TensorDict
 from torch import nn
 
 from verl import DataProto
-from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
+from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
 from verl.workers.rollout.base import BaseRollout
 from verl.third_party.vllm import LLM, vllm_version
 from verl.third_party.vllm import parallel_state as vllm_ps
@@ -191,7 +191,7 @@ class vLLMRollout(BaseRollout):
                 'top_k': self.config.val_kwargs.top_k,
                 'top_p': self.config.val_kwargs.top_p,
                 'temperature': self.config.val_kwargs.temperature,
-                'n': self.config.val_kwargs.n,
+                'n': 1,  # if validate, already repeat in ray_trainer
             }
 
         # users can customize different sampling_params at different run
@@ -229,7 +229,9 @@ class vLLMRollout(BaseRollout):
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[:, -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        response_attention_mask = get_response_mask(response_id=response,
+                                                    eos_token=eos_token_id,
+                                                    dtype=attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid

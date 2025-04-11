@@ -12,110 +12,120 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Preprocess OpenHands SFT Trajectories dataset into parquet format for multi-turn training
+Create a simple multi-turn dataset for testing
 """
 
 import os
+import pandas as pd
 import argparse
-import datasets
-from verl.utils.hdfs_io import copy, makedirs
-from transformers import AutoTokenizer
 
 
-def count_tokens(text, tokenizer):
-    """Count the number of tokens in a text"""
-    return len(tokenizer(text).input_ids)
-
-
-def process_conversation(example, idx, split, tokenizer, max_tokens=32000):
-    """Convert a conversation into the expected format"""
-    messages = []
-    total_tokens = 0
-
-    # Add system message
-    system_msg = {"role": "system", "content": "You are a helpful assistant that can understand and generate code."}
-    total_tokens += count_tokens(system_msg["content"], tokenizer)
-    messages.append(system_msg)
-
-    # Process each turn
-    for i in range(len(example['human'])):
-        # Add human message
-        human_msg = {"role": "user", "content": example['human'][i]}
-        human_tokens = count_tokens(human_msg["content"], tokenizer)
-
-        # Add assistant message
-        assistant_msg = {"role": "assistant", "content": example['assistant'][i]}
-        assistant_tokens = count_tokens(assistant_msg["content"], tokenizer)
-
-        # Check if adding these messages would exceed token limit
-        if total_tokens + human_tokens + assistant_tokens > max_tokens:
-            break
-
-        total_tokens += human_tokens + assistant_tokens
-        messages.append(human_msg)
-        messages.append(assistant_msg)
-
-    # Only return if we have at least one complete turn
-    if len(messages) >= 3:  # system + at least one human-assistant pair
-        return {
-            "data_source": "openhands_sft_trajectories",
-            "messages": messages,
-            "extra_info": {
-                'split': split,
-                'index': idx,
-                'total_tokens': total_tokens,
-                'original_id': example.get('id', None)
-            }
-        }
-    return None
-
-
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--local_dir', default='~/data/multiturn')
     parser.add_argument('--hdfs_dir', default=None)
-    parser.add_argument('--max_tokens', type=int, default=32000)
-
     args = parser.parse_args()
 
-    # Load tokenizer for token counting
-    tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct')
+    # Create example conversations
+    conversations = []
 
-    # Load OpenHands dataset
-    dataset = datasets.load_dataset('SWE-Gym/OpenHands-SFT-Trajectories')
+    # Conversation 1
+    conversations.append({
+        "messages": [{
+            "role": "system",
+            "content": "You are a helpful assistant."
+        }, {
+            "role": "user",
+            "content": "What is the capital of France?"
+        }, {
+            "role": "assistant",
+            "content": "The capital of France is Paris."
+        }, {
+            "role": "user",
+            "content": "And what about Germany?"
+        }, {
+            "role": "assistant",
+            "content": "The capital of Germany is Berlin."
+        }]
+    })
 
-    # Split into train/test (90/10 split)
-    dataset = dataset['train'].train_test_split(test_size=0.1, seed=42)
-    train_dataset = dataset['train']
-    test_dataset = dataset['test']
+    # Conversation 2
+    conversations.append({
+        "messages": [{
+            "role": "system",
+            "content": "You are a helpful assistant."
+        }, {
+            "role": "user",
+            "content": "Can you explain quantum computing?"
+        }, {
+            "role":
+                "assistant",
+            "content":
+                "Quantum computing is a type of computing that uses quantum-mechanical phenomena, such as superposition and entanglement, to perform operations on data."
+        }, {
+            "role": "user",
+            "content": "How is it different from classical computing?"
+        }, {
+            "role":
+                "assistant",
+            "content":
+                "Classical computing uses bits that are either 0 or 1, while quantum computing uses quantum bits or qubits that can exist in multiple states simultaneously due to superposition."
+        }]
+    })
 
-    # Process the datasets
-    train_dataset = train_dataset.map(
-        function=lambda x, i: process_conversation(x, i, 'train', tokenizer, args.max_tokens),
-        with_indices=True,
-        remove_columns=train_dataset.column_names)
-    test_dataset = test_dataset.map(
-        function=lambda x, i: process_conversation(x, i, 'test', tokenizer, args.max_tokens),
-        with_indices=True,
-        remove_columns=test_dataset.column_names)
+    # Conversation 3
+    conversations.append({
+        "messages": [{
+            "role": "system",
+            "content": "You are a helpful assistant."
+        }, {
+            "role": "user",
+            "content": "Write a simple Python function to calculate factorial."
+        }, {
+            "role":
+                "assistant",
+            "content":
+                "```python\ndef factorial(n):\n    if n == 0 or n == 1:\n        return 1\n    else:\n        return n * factorial(n-1)\n```\n\nThis is a recursive function to calculate the factorial of a number."
+        }, {
+            "role": "user",
+            "content": "Can you make it iterative instead?"
+        }, {
+            "role":
+                "assistant",
+            "content":
+                "```python\ndef factorial(n):\n    result = 1\n    for i in range(1, n+1):\n        result *= i\n    return result\n```\n\nThis is an iterative version of the factorial function."
+        }]
+    })
 
-    # Filter out None values (conversations that were too long)
-    train_dataset = train_dataset.filter(lambda x: x is not None)
-    test_dataset = test_dataset.filter(lambda x: x is not None)
+    # Create train and test datasets
+    train_data = conversations[:2]  # First 2 conversations for training
+    test_data = conversations[2:]  # Last conversation for testing
 
     # Create output directory
     local_dir = os.path.expanduser(args.local_dir)
     os.makedirs(local_dir, exist_ok=True)
 
     # Save to parquet files
-    train_dataset.to_parquet(os.path.join(local_dir, 'train.parquet'))
-    test_dataset.to_parquet(os.path.join(local_dir, 'test.parquet'))
+    train_df = pd.DataFrame(train_data)
+    test_df = pd.DataFrame(test_data)
 
+    train_df.to_parquet(os.path.join(local_dir, 'train.parquet'))
+    test_df.to_parquet(os.path.join(local_dir, 'test.parquet'))
+
+    # Handle HDFS if specified
     if args.hdfs_dir is not None:
-        makedirs(args.hdfs_dir)
-        copy(src=local_dir, dst=args.hdfs_dir)
+        try:
+            from verl.utils.hdfs_io import copy, makedirs
+            makedirs(args.hdfs_dir)
+            copy(src=local_dir, dst=args.hdfs_dir)
+        except ImportError:
+            print("Warning: HDFS support not available. Skipping HDFS copy.")
 
     # Print statistics
-    print(f"Train dataset size: {len(train_dataset)}")
-    print(f"Test dataset size: {len(test_dataset)}")
+    print(f"Train dataset size: {len(train_df)}")
+    print(f"Test dataset size: {len(test_df)}")
     print(f"Data saved to {local_dir}")
+
+
+if __name__ == '__main__':
+    main()

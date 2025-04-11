@@ -16,8 +16,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
      -m verl.trainer.fsdp_sft_trainer \
     data.train_files=$HOME/data/multiturn/train.parquet \
     data.val_files=$HOME/data/multiturn/test.parquet \
-    data.use_multiturn=true \
-    data.messages_key=messages \
+    data.multiturn.enable=true \
+    data.multiturn.messages_key=messages \
     data.micro_batch_size=4 \
     model.partial_pretrain=Qwen/Qwen2.5-0.5B-Instruct \
     trainer.default_local_dir=$save_path \
