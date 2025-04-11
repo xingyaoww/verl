@@ -33,12 +33,11 @@ from tensordict import TensorDict
 from torch.utils.data import DataLoader, DistributedSampler
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
-import verl.utils.torch_functional as verl_F
 from verl.utils.fsdp_utils import get_fsdp_wrap_policy, init_fn, get_init_weight_context_manager
 from verl.utils.dataset.multiturn_rm_dataset import MultiTurnRMDataset
 from verl.utils.fs import copy_to_local
 from verl.utils.tracking import Tracking
-from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, set_ulysses_sequence_parallel_group
+from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size
 from torch.distributed.device_mesh import DeviceMesh
 
 from verl.utils.debug import log_gpu_memory_usage
@@ -138,12 +137,6 @@ class FSDPRMTrainer(FSDPSFTTrainer):
         config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=trust_remote_code)
         if self.config.ulysses_sequence_parallel_size > 1:
             assert self.use_remove_padding, "Sequence parallel is only supported when remove_padding is enabled"
-            from verl.models.registry import check_model_support_rmpad
-            check_model_support_rmpad(config.model_type)
-
-        if self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1:
-            from verl.models.transformers.monkey_patch import apply_monkey_patch
-            apply_monkey_patch(config, verbose=True)
 
         # Hard-coded for RM - it is an regression task
         config.num_labels = 1
@@ -168,6 +161,10 @@ class FSDPRMTrainer(FSDPSFTTrainer):
                                                                                torch_dtype=torch.float32,
                                                                                attn_implementation='flash_attention_2',
                                                                                trust_remote_code=trust_remote_code)
+
+            if self.use_remove_padding or self.config.ulysses_sequence_parallel_size > 1:
+                from verl.models.transformers.monkey_patch import apply_monkey_patch
+                apply_monkey_patch(model=self.model, ulysses_sp_size=self.config.ulysses_sequence_parallel_size)
 
             # Apply Liger kernel if use_liger is enabled
             if self.config.model.get('use_liger', False):
