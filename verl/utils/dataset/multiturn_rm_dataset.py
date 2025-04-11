@@ -37,24 +37,22 @@ class MultiTurnRMDataset(MultiTurnSFTDataset):
             self,
             parquet_files: Union[str, List[str]],
             tokenizer,
-            messages_key='messages',  # Key for the messages list in the parquet file
-            max_length=1024,
-            truncation='error',
-            td_returns_gamma=0.99,
-            last_action_only=False,
-            special_token_id=None,
-            ):
-        super().__init__(parquet_files, tokenizer, messages_key, max_length, truncation)
-        self.td_returns_gamma = td_returns_gamma
-        self.last_action_only = last_action_only
-        self.special_token_id = special_token_id
+            config
+        ):
+        multiturn_config = config.get('multiturn', {})
+        assert multiturn_config.get('enable', False), "Multi-turn dataset is not enabled. This is required for RM dataset."
+        super().__init__(parquet_files, tokenizer=tokenizer, config=config)
+
+        self.td_returns_gamma = config.get('td_returns_gamma', 0.99)
+        self.last_action_only = config.get('last_action_only', False)
+        self.special_token_id = config.get('special_token_id', None)
         print(f'RM Dataset: {self.last_action_only=}; {self.td_returns_gamma=}; {self.special_token_id=} (actual token: {self.tokenizer.decode([self.special_token_id]) if self.special_token_id is not None else "None"})')
         assert (self.last_action_only and self.td_returns_gamma == 1.0) or not self.last_action_only, "TD returns gamma must 1.0 if last_action_only is True"
         assert self.truncation == 'error', "Truncation must be error for RM dataset"
 
     def _read_files_and_process(self):
         super()._read_files_and_process()
-        
+
         def series_to_item(ls):
             import pandas, numpy
             while isinstance(ls, (pandas.core.series.Series, numpy.ndarray)) and len(ls) == 1:

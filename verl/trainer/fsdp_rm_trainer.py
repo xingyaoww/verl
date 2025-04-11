@@ -63,20 +63,10 @@ class FSDPRMTrainer(FSDPSFTTrainer):
         # Multi-turn dataset uses messages_key instead of prompt/response keys
         self.train_dataset = MultiTurnRMDataset(parquet_files=config.data.train_files,
                                                tokenizer=self.tokenizer,
-                                               messages_key=config.data.messages_key,
-                                               max_length=config.data.max_length,
-                                               truncation=config.data.truncation,
-                                               td_returns_gamma=config.data.td_returns_gamma,
-                                               last_action_only=config.data.last_action_only,
-                                               special_token_id=config.data.special_token_id)
+                                               config=config.data)
         self.val_dataset = MultiTurnRMDataset(parquet_files=config.data.val_files,
                                             tokenizer=self.tokenizer,
-                                            messages_key=config.data.messages_key,
-                                            max_length=config.data.max_length,
-                                            truncation=config.data.truncation,
-                                            td_returns_gamma=config.data.td_returns_gamma,
-                                            last_action_only=config.data.last_action_only,
-                                            special_token_id=config.data.special_token_id)
+                                            config=config.data)
 
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
