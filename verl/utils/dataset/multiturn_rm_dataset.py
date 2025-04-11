@@ -25,7 +25,7 @@ from transformers import PreTrainedTokenizer
 from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils import hf_tokenizer
-from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset, series_to_item
+from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.trainer.ppo.core_algos import compute_td_returns
 
 class MultiTurnRMDataset(MultiTurnSFTDataset):
@@ -54,6 +54,12 @@ class MultiTurnRMDataset(MultiTurnSFTDataset):
 
     def _read_files_and_process(self):
         super()._read_files_and_process()
+        
+        def series_to_item(ls):
+            import pandas, numpy
+            while isinstance(ls, (pandas.core.series.Series, numpy.ndarray)) and len(ls) == 1:
+                ls = ls[0]
+            return ls
         self.task_rewards = self.dataframe['task_reward'].apply(series_to_item).tolist()
 
     def __getitem__(self, item):
