@@ -289,8 +289,8 @@ class FSDPSFTTrainer(object):
                                                                 num_training_steps=self.total_steps)
         elif self.config.optim.lr_scheduler == 'wsd':
             self.lr_scheduler = get_wsd_schedule_with_warmup(optimizer=self.optimizer,
-                                                            num_warmup_steps=num_warmup_steps,
-                                                            num_training_steps=self.total_steps)
+                                                             num_warmup_steps=num_warmup_steps,
+                                                             num_training_steps=self.total_steps)
         else:
             raise ValueError(f'Unknown lr scheduler: {self.config.optim.lr_scheduler}')
 
