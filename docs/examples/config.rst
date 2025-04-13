@@ -3,8 +3,8 @@
 Config Explanation
 ===================
 
-ppo_trainer.yaml for FSDP Backend
----------------------------------
+ppo_trainer.yaml for RL FSDP Backend
+-------------------------------------
 
 Data
 ~~~~
@@ -483,8 +483,8 @@ Customized Reward Function
 - ``custom_reward_function.path``: The path to the file containing your customized reward function. If not specified, pre-implemented reward functions will be used.
 - ``custom_reward_function.name`` (Optional) : The name of the reward function within the specified file. Default is 'compute_score'.
 
-sft_trainer.yaml for FSDP Backend
----------------------------------
+sft_trainer.yaml for SFT FSDP Backend
+--------------------------------------
 
 .. code:: yaml
 
@@ -500,5 +500,6 @@ sft_trainer.yaml for FSDP Backend
 - ``optim.warmup_steps_ratio``: Ratio of warmup steps to total training steps.
 - ``optim.clip_grad``: Gradient clipping value.
 - ``optim.lr_scheduler``: Learning rate scheduler type. Options:
+
   - ``cosine``: Cosine learning rate scheduler with warmup (default).
   - ``wsd``: Warmup-Stable-Decay scheduler that provides a stable learning rate phase between warmup and decay phases.
