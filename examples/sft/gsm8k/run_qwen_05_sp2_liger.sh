@@ -18,7 +18,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     data.prompt_key=extra_info \
     data.response_key=extra_info \
     optim.lr=1e-4 \
-    +data.prompt_dict_keys=['question'] \
+    data.prompt_dict_keys=['question'] \
     +data.response_dict_keys=['answer'] \
     data.micro_batch_size=4 \
     model.partial_pretrain=Qwen/Qwen2.5-0.5B-Instruct \
@@ -26,7 +26,6 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     trainer.default_local_dir=$save_path \
     trainer.project_name=gsm8k-sft \
     trainer.experiment_name=gsm8k-sft-qwen-2.5-0.5b-instruct-sp2-liger \
-    trainer.logger=['console'] \
-    trainer.default_hdfs_dir=null $@ \
+    trainer.logger=console $@ \
     ulysses_sequence_parallel_size=2 \
     use_remove_padding=true

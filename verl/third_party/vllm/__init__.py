@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from importlib.metadata import version, PackageNotFoundError
+from importlib.metadata import PackageNotFoundError, version
+
 from packaging import version as vs
+
+from verl.utils.device import is_npu_available
 from verl.utils.import_utils import is_sglang_available
 
 
@@ -24,43 +27,38 @@ def get_version(pkg):
         return None
 
 
-package_name = 'vllm'
+package_name = "vllm"
 package_version = get_version(package_name)
 vllm_version = None
+VLLM_SLEEP_LEVEL = 1
 
-if package_version == '0.3.1':
-    vllm_version = '0.3.1'
-    from .vllm_v_0_3_1.llm import LLM
-    from .vllm_v_0_3_1.llm import LLMEngine
-    from .vllm_v_0_3_1 import parallel_state
-elif package_version == '0.4.2':
-    vllm_version = '0.4.2'
-    from .vllm_v_0_4_2.llm import LLM
-    from .vllm_v_0_4_2.llm import LLMEngine
-    from .vllm_v_0_4_2 import parallel_state
-elif package_version == '0.5.4':
-    vllm_version = '0.5.4'
-    from .vllm_v_0_5_4.llm import LLM
-    from .vllm_v_0_5_4.llm import LLMEngine
-    from .vllm_v_0_5_4 import parallel_state
-elif package_version == '0.6.3':
-    vllm_version = '0.6.3'
-    from .vllm_v_0_6_3.llm import LLM
-    from .vllm_v_0_6_3.llm import LLMEngine
-    from .vllm_v_0_6_3 import parallel_state
-elif package_version == '0.6.3+rocm624':
-    vllm_version = '0.6.3'
-    from .vllm_v_0_6_3.llm import LLM
-    from .vllm_v_0_6_3.llm import LLMEngine
-    from .vllm_v_0_6_3 import parallel_state
-elif vs.parse(package_version) >= vs.parse('0.7.0'):
-    # From 0.6.6.post2 on, vllm supports SPMD inference
-    # See https://github.com/vllm-project/vllm/pull/12071
-
+if package_version is None:
+    if not is_sglang_available():
+        raise ValueError(
+            f"vllm version {package_version} not supported and SGLang also not Found. Currently supported "
+            f"vllm versions are 0.7.0+"
+        )
+elif is_npu_available:
+    # sleep_mode=2 is not supported on vllm-ascend for now, will remove this restriction when this ability is ready.
+    VLLM_SLEEP_LEVEL = 1
+    from vllm import LLM
+    from vllm.distributed import parallel_state
+elif vs.parse(package_version) >= vs.parse("0.7.0"):
+    vllm_version = package_version
+    if vs.parse(package_version) >= vs.parse("0.8.5"):
+        VLLM_SLEEP_LEVEL = 2
     from vllm import LLM
     from vllm.distributed import parallel_state
 else:
+    if vs.parse(package_version) in [vs.parse("0.5.4"), vs.parse("0.6.3")]:
+        raise ValueError(
+            f"vLLM version {package_version} support has been removed. vLLM 0.5.4 and 0.6.3 are no longer "
+            f"supported. Please use vLLM 0.7.0 or later."
+        )
     if not is_sglang_available():
         raise ValueError(
-            f'vllm version {package_version} not supported and SGLang also not Found. Currently supported vllm versions are 0.3.1, 0.4.2, 0.5.4, 0.6.3 and 0.7.0+'
+            f"vllm version {package_version} not supported and SGLang also not Found. Currently supported "
+            f"vllm versions are 0.7.0+"
         )
+
+__all__ = ["LLM", "parallel_state"]

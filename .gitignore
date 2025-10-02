@@ -58,6 +58,8 @@ nosetests.xml
 coverage.xml
 *,cover
 .hypothesis/
+pytest.ini
+output.txt
 
 # Translations
 *.mo
@@ -109,9 +111,6 @@ ENV/
 # Mac
 .DS_Store
 
-# output logs
-tests/e2e/toy_examples/deepspeed/synchronous/output.txt
-
 # vim
 *.swp
 
@@ -126,3 +125,4 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 logs
 log
 outputs
+.history

@@ -1,12 +1,14 @@
 Multinode Training
 ==================
 
+Last updated: 06/10/2025.
+
 .. _wuxibin89: https://github.com/wuxibin89
 
 Author: `Xibin Wu <https://github.com/wuxibin89>`_, `Yusheng Su <https://yushengsu-thu.github.io/>`_.
 
-Manual
-------
+Option 1: Launch Manually
+------------------------------
 
 Set up multinode ray cluster
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -54,6 +56,8 @@ Submit job to ray cluster
 - ray job logs <Submission ID>: query the logs of the job.
 - ray job status <Submission ID>: query the status of the job.
 - ray job stop <Submission ID>: request the job to be stopped.
+- ray job list | grep submission_id | grep JobStatus | grep RUNNING | grep -oP 'raysubmit_[^'\''"]+' | head -n 1: get the latest job submission ID of the running job.
+- ray job logs <Submission ID> --follow: added ``--follow`` parameter to ray job logs command to enable continuous log streaming.
 
 3. You can also access driver/task/actor logs in ``/tmp/ray/session_latest/logs/``, driver log is ``job-driver-raysubmit_<Submission ID>.log``.
 
@@ -62,13 +66,429 @@ Submit job to ray cluster
 .. image:: https://github.com/eric-haibin-lin/verl-community/blob/main/docs/ray/job.png?raw=true
 .. image:: https://github.com/eric-haibin-lin/verl-community/blob/main/docs/ray/job_detail.png?raw=true
 
+Option 2: Launch via SkyPilot on Kubernetes or clouds
+------------------------------------------------------
 
-Slurm
------
-TBD
+.. note::
+   Ready-to-use SkyPilot example configurations are available in the `examples/skypilot/ <https://github.com/volcengine/verl/tree/main/examples/skypilot>`_ directory:
+   
+   - ``verl-ppo.yaml`` - PPO training with GSM8K dataset
+   - ``verl-grpo.yaml`` - GRPO training with MATH dataset  
+   - ``verl-multiturn-tools.yaml`` - Multi-turn tool usage training
+   
+   See the `SkyPilot examples README <https://github.com/volcengine/verl/tree/main/examples/skypilot>`_ for detailed usage instructions.
+
+Step 1: Setup SkyPilot
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+SkyPilot can support different clouds, here we use GCP as example. `install skypilot <https://docs.skypilot.co/en/latest/getting-started/installation.html>`_
+
+.. code-block:: bash
+
+    conda create -y -n sky python=3.10
+    conda activate sky
+    pip install "skypilot[gcp]"
+
+    conda install -c conda-forge google-cloud-sdk
+    gcloud init
+
+    # Run this if you don't have a credential file.
+    # This will generate ~/.config/gcloud/application_default_credentials.json.
+    gcloud auth application-default login
+
+    # Check if the GCP credential is correctly setup.
+    sky check gcp
+
+.. image:: https://github.com/yottalabsai/open-source/blob/main/static/verl/setup_skypilot.png?raw=true
+
+Step 2: Prepare dataset
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: bash
+
+   git clone https://github.com/volcengine/verl.git
+   cd examples/data_preprocess
+   python3 gsm8k.py --local_save_dir ~/data/gsm8k
+
+
+Step 3: Submit a job with SkyPilot
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+1. Create a SkyPilot YAML ``verl-cluster.yml`` with the following content:
+
+.. parsed-literal:: workdir: .  will sync all the data in the current dir to the remote cluster.
+
+.. code-block:: yaml
+
+   resources:
+     accelerators: L4:1 # every node has 1 L4 GPU
+     image_id: docker:verlai/verl:base-verl0.5-cu126-cudnn9.8-torch2.7.0-fa2.7.4
+     memory: 64+        # every node has 64 GB memory
+     ports: 8265        # expose port for ray dashboard
+
+   num_nodes: 2         # cluster size
+
+   # --------------- Work Directory Synchronization (workdir) ---------------
+   # Defines the local working directory to be synchronized to the remote cluster.
+   # Here, '.' means synchronizing the directory where the sky submit command is currently run.
+   workdir: .
+
+   # --------------- (secrets) ---------------
+   secrets:
+     ## your wandb api key ##
+     WANDB_API_KEY: null
+
+   # --------------- File Mounts/Data Upload (file_mounts) ---------------
+   # If your dataset (gsm8k folder) is local, it needs to be uploaded to the remote cluster.
+   file_mounts:
+     # Remote path (relative to remote user's home directory): Local path
+     # /remote/dir1/file: /local/dir1/file
+     data/gsm8k: ~/data/gsm8k
+
+   # --------------- Environment Setup (setup) ---------------
+   # Commands run on each node of the remote cluster to set up the environment (e.g., install dependencies). These are run directly inside Docker.
+   setup: |
+     rm -rf verl
+     git clone https://github.com/volcengine/verl.git
+     cd verl
+     pip3 install -v -e .[vllm]
+
+   # --------------- Run Command (run) ---------------
+   # The actual task commands to be executed on the remote cluster.
+   # This script will first start the Ray cluster (different ray start commands are executed on Head and Worker nodes).
+   # Then, your training script will only be run on the Head node (SKYPILOT_NODE_RANK == 0).
+   run: |
+     # Get the Head node's IP and total number of nodes (environment variables injected by SkyPilot).
+     head_ip=`echo "$SKYPILOT_NODE_IPS" | head -n1`
+     num_nodes=`echo "$SKYPILOT_NODE_IPS" | wc -l` # Here num_nodes should be equal to 2.
+
+     # login wandb
+     python3 -c "import wandb; wandb.login(relogin=True, key='$WANDB_API_KEY')"
+
+     # Start Ray based on node role (Head=0, Worker>0).
+     # This logic is a standard Ray cluster startup script.
+     if [ "$SKYPILOT_NODE_RANK" == "0" ]; then
+       # Head node starts Ray Head.
+       echo "Starting Ray head node..."
+       # Check if a Ray Head is already running to avoid duplicate starts.
+       ps aux | grep ray | grep 6379 &> /dev/null ||  ray start --head --disable-usage-stats \
+             --port=6379 \
+             --dashboard-host=0.0.0.0 \
+             --dashboard-port=8265
+
+       # Wait for all worker nodes to join the cluster.
+       while [ $(ray nodes | grep NODE_ID | wc -l) -lt $num_nodes ]; do
+         echo "Waiting for all nodes to join... ($(ray nodes | grep NODE_ID | wc -l)/$num_nodes)"
+         sleep 5
+       done
+
+       # Head node executes the training script.
+       echo "Executing training script on head node..."
+
+       python3 -m verl.trainer.main_ppo \
+        data.train_files=data/gsm8k/train.parquet \
+        data.val_files=data/gsm8k/test.parquet \
+        data.train_batch_size=256 \
+        data.max_prompt_length=512 \
+        data.max_response_length=256 \
+        actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
+        actor_rollout_ref.actor.optim.lr=1e-6 \
+        actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+        actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+        actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+        actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+        actor_rollout_ref.rollout.name=vllm \
+        actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+        actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+        critic.optim.lr=1e-5 \
+        critic.model.path=Qwen/Qwen2.5-0.5B-Instruct \
+        critic.ppo_micro_batch_size_per_gpu=4 \
+        algorithm.kl_ctrl.kl_coef=0.001 \
+        trainer.logger=['console','wandb'] \
+        trainer.val_before_train=False \
+        trainer.default_hdfs_dir=null \
+        trainer.n_gpus_per_node=1 \
+        trainer.nnodes=2 \
+        trainer.save_freq=20 \
+        trainer.test_freq=20 \
+        trainer.total_epochs=2 \
+        trainer.project_name=verl_examples \
+        trainer.experiment_name=experiment_name_gsm8k
+
+     else
+       # Wait for Ray Head to start.
+       sleep 10 # Increase waiting time to ensure Head finishes starting.
+       # Worker node starts Ray Worker.
+       echo "Starting Ray worker node..."
+
+       # Check if a Ray Worker is already running to avoid duplicate starts.
+       ps aux | grep ray | grep $head_ip:6379 &> /dev/null || ray start --address $head_ip:6379 --disable-usage-stats
+
+       # Add sleep to after `ray start` to give ray enough time to daemonize
+       sleep 5 # Ensure Worker successfully connects to Head.
+     fi
+
+     # No commands are added to the Worker node here; the Worker's main task is to start Ray and wait for the Head node to assign tasks.
+     echo "Node setup and Ray start script finished for rank $SKYPILOT_NODE_RANK."
+
+
+.. code-block:: bash
+
+    export WANDB_API_KEY=<your-wandb-api-key>
+    sky launch -c verl --secret WANDB_API_KEY verl-cluster.yml
+
+.. image:: https://github.com/yottalabsai/open-source/blob/main/static/verl/running_job.png?raw=true
+.. image:: https://github.com/yottalabsai/open-source/blob/main/static/verl/running_job_1.png?raw=true
+.. image:: https://github.com/yottalabsai/open-source/blob/main/static/verl/finished.png?raw=true
+
+**Check the cluster on GCP**
+
+.. image:: https://github.com/yottalabsai/open-source/blob/main/static/verl/gcp_instances.png?raw=true
+
+**Check Ray Dashboard**
+
+We can see the cluster on the RAY Dashboard with the GCP head node:
+
+```console
+$ sky status --endpoint 8265 verl
+1.2.3.4:8265
+```
+
+.. image:: https://github.com/yottalabsai/open-source/blob/main/static/verl/ray_dashboard_overview.png?raw=true
+.. image:: https://github.com/yottalabsai/open-source/blob/main/static/verl/ray_dashboard_jobs.png?raw=true
+.. image:: https://github.com/yottalabsai/open-source/blob/main/static/verl/ray_dashboard_cluster.png?raw=true
+
+
+**Check the checkpoint of model**
+
+.. code-block:: bash
+
+    # login the head node
+    ssh verl
+    # The global step will vary. Find the correct path from the training logs.
+    cd ~/sky_workdir/checkpoints/verl_examples/gsm8k/
+    # Then list contents to find the checkpoint, e.g.:
+    ls -R .
+
+.. image:: https://github.com/yottalabsai/open-source/blob/main/static/verl/saved_model.png?raw=true
+
+
+Option 3: Launch via Slurm
+------------------------------
+
+Ray provides users with `this <https://docs.ray.io/en/latest/cluster/vms/user-guides/community/slurm.html>`_ official
+tutorial to start a Ray cluster on top of Slurm. We have verified the :doc:`GSM8K example<../examples/gsm8k_example>`
+on a Slurm cluster under a multi-node setting with the following steps.
+
+1. [Optional] If your cluster support `Apptainer or Singularity <https://apptainer.org/docs/user/main/>`_ and you wish
+to use it, convert verl's Docker image to an Apptainer image. Alternatively, set up the environment with the package
+manager available on your cluster or use other container runtimes (e.g. through `Slurm's OCI support <https://slurm.schedmd.com/containers.html>`_) available to you.
+
+.. code:: bash
+
+    apptainer pull /your/dest/dir/vemlp-th2.4.0-cu124-vllm0.6.3-ray2.10-te1.7-v0.0.3.sif docker://verlai/verl:vemlp-th2.4.0-cu124-vllm0.6.3-ray2.10-te1.7-v0.0.3
+
+2. Follow :doc:`GSM8K example<../examples/gsm8k_example>` to prepare the dataset and model checkpoints.
+
+3. Modify `examples/slurm/ray_on_slurm.slurm <https://github.com/volcengine/verl/blob/main/examples/slurm/ray_on_slurm.slurm>`_ with your cluster's own information.
+
+4. Submit the job script to the Slurm cluster with `sbatch`.
+
+Please note that Slurm cluster setup may vary. If you encounter any issues, please refer to Ray's
+`Slurm user guide <https://docs.ray.io/en/latest/cluster/vms/user-guides/community/slurm.html>`_ for common caveats.
+
+If you changed Slurm resource specifications, please make sure to update the environment variables in the job script if necessary.
+
+
+Option 4: Launch via dstack
+------------------------------
+
+`dstackai/dstack <https://github.com/dstackai/dstack>`_ is an open-source container orchestrator that simplifies distributed training across cloud providers and on-premises environments
+without the need to use K8S or Slurm.
+
+Prerequisite
+~~~~~~~~~~~~
+Once dstack is `installed <https://dstack.ai/docs/installation>`_, initialize the directory as a repo with ``dstack init``. 
+
+.. code-block:: bash
+
+    mkdir myproject && cd myproject
+    dstack init
+
+**Create a fleet**
+
+Before submitting distributed training jobs, create a `dstack` `fleet <https://dstack.ai/docs/concepts/fleets>`_.
+
+Run a Ray cluster task
+~~~~~~~~~~~~~~~~~~~~~~
+
+Once the fleet is created, define a Ray cluster task, e.g. in ``ray-cluster.dstack.yml``:
+
+.. code-block:: yaml
+
+    type: task
+    name: ray-verl-cluster
+
+    nodes: 2
+
+    env:
+        - WANDB_API_KEY
+        - PYTHONUNBUFFERED=1
+        - CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+    
+    image: whatcanyousee/verl:ngc-cu124-vllm0.8.5-sglang0.4.6-mcore0.12.0-te2.2
+    commands:
+        - git clone https://github.com/volcengine/verl
+        - cd verl
+        - pip install --no-deps -e .
+        - pip install hf_transfer hf_xet
+        - |
+        if [ $DSTACK_NODE_RANK = 0 ]; then
+            python3 examples/data_preprocess/gsm8k.py --local_save_dir ~/data/gsm8k
+            python3 -c "import transformers; transformers.pipeline('text-generation', model='Qwen/Qwen2.5-7B-Instruct')" 
+            ray start --head --port=6379;
+        else
+            ray start --address=$DSTACK_MASTER_NODE_IP:6379
+        fi
+
+    # Expose Ray dashboard port
+    ports:
+        - 8265
+
+    resources:
+        gpu: 80GB:8
+        shm_size: 128GB
+
+    # Save checkpoints on the instance
+    volumes:
+        - /checkpoints:/checkpoints
+
+Now, if you run this task via `dstack apply`, it will automatically forward the Ray's dashboard port to `localhost:8265`.
+
+.. code-block:: bash
+
+    dstack apply -f ray-cluster.dstack.yml
+
+As long as the `dstack apply` is attached, you can use `localhost:8265` to submit Ray jobs for execution
+
+Submit Ray jobs
+~~~~~~~~~~~~~~~
+
+Before you can submit Ray jobs, ensure to install `ray` locally:
+   
+.. code-block:: shell
+
+    pip install ray
+
+Now you can submit the training job to the Ray cluster which is available at ``localhost:8265``:
+   
+.. code-block:: shell
+
+    $ RAY_ADDRESS=http://localhost:8265
+    $ ray job submit \
+        -- python3 -m verl.trainer.main_ppo \
+        data.train_files=/root/data/gsm8k/train.parquet \
+        data.val_files=/root/data/gsm8k/test.parquet \
+        data.train_batch_size=256 \
+        data.max_prompt_length=512 \
+        data.max_response_length=256 \
+        actor_rollout_ref.model.path=Qwen/Qwen2.5-7B-Instruct \
+        actor_rollout_ref.actor.optim.lr=1e-6 \
+        actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+        actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+        actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+        actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+        actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+        actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+        critic.optim.lr=1e-5 \
+        critic.model.path=Qwen/Qwen2.5-7B-Instruct \
+        critic.ppo_micro_batch_size_per_gpu=4 \
+        algorithm.kl_ctrl.kl_coef=0.001 \
+        trainer.project_name=ppo_training \
+        trainer.experiment_name=qwen-2.5-7B \
+        trainer.val_before_train=False \
+        trainer.n_gpus_per_node=8 \
+        trainer.nnodes=2 \
+        trainer.default_local_dir=/checkpoints \
+        trainer.save_freq=10 \
+        trainer.test_freq=10 \
+        trainer.total_epochs=15 2>&1 | tee verl_demo.log \
+        trainer.resume_mode=disable
+
+
+For more details on how `dstack` works, check out its `documentation <https://dstack.ai/docs>`_.
 
 How to debug?
 ---------------------
+
+
+Ray Distributed Debugger VSCode Extension (Recommended)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+1. Starting with Ray 2.39, Anyscale has introduced the `Ray Distributed Debugger <https://docs.ray.io/en/latest/ray-observability/ray-distributed-debugger.html>`_ VSCode extension. Follow the extension’s installation instructions, then add your cluster using the dashboard URL you obtained earlier.
+
+   .. image:: https://github.com/eric-haibin-lin/verl-community/blob/main/docs/ray/debugger.png?raw=true
+      :alt: Ray Distributed Debugger VSCode extension screenshot
+
+2. Prerequisites.
+
+   Ensure the following are installed (see the extension README for more detail):
+
+   - Visual Studio Code  
+   - `ray[default]` >= 2.9.1  
+   - `debugpy` >= 1.8.0  
+
+   .. image:: https://github.com/aoshen524/verl/blob/main/docs/start/c7098b755ff689859837773a916c857.png?raw=true
+      :alt: VSCode with Ray prerequisites
+
+3. Environment Variables.
+
+   To enable post‑mortem debugging, set:
+
+   .. code-block:: bash
+
+      export RAY_DEBUG_POST_MORTEM=1
+
+   .. admonition:: Note
+      :class: important
+
+      Be sure to remove any legacy flags before starting Ray:
+
+      - `RAY_DEBUG=legacy`  
+      - `--ray-debugger-external`
+
+4. Configuring BreakpointsSet up breakpoint() in your code, and submit job to cluster. Then the extension will show the breakpoint information.
+
+
+   1. Insert `breakpoint()` calls into your remote functions.  
+   2. Submit your job to the cluster.  
+
+   The extension will detect active breakpoints and display them in VSCode.
+
+   .. image:: https://github.com/aoshen524/verl/blob/main/docs/start/4ddad74395c79a1402331c0ce73316f.png?raw=true
+      :alt: Detected breakpoint in VSCode
+
+   **Note:** Breakpoints are only supported inside functions decorated with `@ray.remote`.
+
+5. Launching the Debugger.
+
+   Run your job directly from the command line (do not use a `launch.json`):
+
+   .. code-block:: bash
+
+      python job.py
+
+6. Attaching to a Breakpoint.
+
+ Once the process hits the first `breakpoint()`, click the Ray Distributed Debugger icon in the VSCode sidebar to attach the debugger.
+
+   .. image:: https://github.com/aoshen524/verl/blob/main/docs/start/4ddad74395c79a1402331c0ce73316f.png?raw=true
+      :alt: Attaching VSCode debugger to Ray process
+
+7. Debugging With Multiple breakpoint().
+
+   For each subsequent task, first disconnect the current debugger session, then click the extension icon again to attach to the next breakpoint.
+
+   .. image:: https://github.com/aoshen524/verl/blob/main/docs/start/6e83c910a62c82fecb89c6619e001cd.png?raw=true
+      :alt: Disconnecting and reconnecting the debugger
 
 Legacy Ray Debugger
 ~~~~~~~~~~~~~~~~~~~
@@ -84,26 +504,6 @@ Legacy Ray Debugger
 2. Set up breakpoint in your code, and submit job to cluster. Then run ``ray debug`` to wait breakpoint:
 
 .. image:: https://github.com/eric-haibin-lin/verl-community/blob/main/docs/ray/legacy.png?raw=true
-
-Ray Distributed Debugger VSCode Extension
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-1. Starting with Ray 2.39, Anyscale introduce a new `Ray Distributed Debugger <https://docs.ray.io/en/latest/ray-observability/ray-distributed-debugger.html>`_ VSCode extension. Please follow the instruction to install the extension, and then add cluster with the dashboard address you get above.
-
-*NOTE: Don't forget remove RAY_DEBUG=legacy and --ray-debugger-external in ray start*
-
-.. image:: https://github.com/eric-haibin-lin/verl-community/blob/main/docs/ray/debugger.png?raw=true
-
-2. Set up breakpoint in your code, and submit job to cluster. Then the extension will show the breakpoint information.
-
-.. image:: https://github.com/eric-haibin-lin/verl-community/blob/main/docs/ray/breakpoint.png?raw=true
-
-
-
-
-
-
-
 
 
 Multi-node training on AMD clusters
@@ -283,7 +683,6 @@ slurm_script.sh
     echo "IP Head: $ip_head"
 
     # make sure we set environment variables before Ray initialization
-    export VLLM_ATTENTION_BACKEND=XFORMERS
 
     # Print out all env variables
     printenv
@@ -317,7 +716,7 @@ slurm_script.sh
 
 
 
-    # Ray initlization test (See whether any error in the above excution)
+    # Ray initlization test (See whether any error in the above execution)
     echo "Testing Ray initialization in the slurm nodes..."
     docker exec "${CONTAINER_NAME}" python3 -c '
     import ray
@@ -342,7 +741,7 @@ slurm_script.sh
 
     echo "Starting data preprocessing..."
     docker exec "${CONTAINER_NAME}" \
-        python3 "examples/data_preprocess/gsm8k.py" "--local_dir" "../data/gsm8k"
+        python3 "examples/data_preprocess/gsm8k.py" "--local_save_dir" "../data/gsm8k"
 
     echo "Starting data preprocessing..."
     docker exec "${CONTAINER_NAME}" \
@@ -401,7 +800,7 @@ slurm_script.sh
         critic.model.fsdp_config.optimizer_offload=False \
         algorithm.kl_ctrl.kl_coef=0.0001 \
         trainer.critic_warmup=0 \
-        trainer.logger=['console','wandb'] \
+        trainer.logger='["console","wandb"]' \
         trainer.project_name='verl_example' \
         trainer.experiment_name='Qwen2.5-32B-Instruct_function_rm' \
         trainer.n_gpus_per_node=${SLURM_GPUS_PER_NODE} \

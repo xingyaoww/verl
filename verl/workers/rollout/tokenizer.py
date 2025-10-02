@@ -14,10 +14,13 @@
 """
 The base tokenizer class, required for any hybrid engine based rollout or inference with vLLM.
 """
-from abc import ABC, abstractmethod
-from typing import Dict, List, Union
 
-__all__ = ['HybridEngineBaseTokenizer']
+from abc import ABC, abstractmethod
+
+import numpy as np
+import torch
+
+__all__ = ["HybridEngineBaseTokenizer"]
 
 
 class HybridEngineBaseTokenizer(ABC):
@@ -50,7 +53,7 @@ class HybridEngineBaseTokenizer(ABC):
 
     @property
     @abstractmethod
-    def all_special_ids(self) -> List[int]:
+    def all_special_ids(self) -> list[int]:
         """
         `List[int]`: List the ids of the special tokens(`'<unk>'`, `'<cls>'`, etc.) mapped to class attributes.
         """
@@ -58,7 +61,7 @@ class HybridEngineBaseTokenizer(ABC):
 
     @property
     @abstractmethod
-    def all_special_tokens(self) -> List[str]:
+    def all_special_tokens(self) -> list[str]:
         """
         `List[str]`: A list of the unique special tokens (`'<unk>'`, `'<cls>'`, ..., etc.).
 
@@ -85,7 +88,7 @@ class HybridEngineBaseTokenizer(ABC):
     @abstractmethod
     def decode(
         self,
-        token_ids: Union[int, List[int], "np.ndarray", "torch.Tensor", "tf.Tensor"],
+        token_ids: int | list[int] | np.ndarray | torch.Tensor,
         skip_special_tokens: bool = False,
         clean_up_tokenization_spaces: bool = None,
         **kwargs,
@@ -97,7 +100,7 @@ class HybridEngineBaseTokenizer(ABC):
         Similar to doing `self.convert_tokens_to_string(self.convert_ids_to_tokens(token_ids))`.
 
         Args:
-            token_ids (`Union[int, List[int], np.ndarray, torch.Tensor, tf.Tensor]`):
+            token_ids (`Union[int, List[int], np.ndarray, torch.Tensor]`):
                 List of tokenized input ids. Can be obtained using the `__call__` method.
             skip_special_tokens (`bool`, *optional*, defaults to `False`):
                 Whether or not to remove special tokens in the decoding.
@@ -113,9 +116,7 @@ class HybridEngineBaseTokenizer(ABC):
         pass
 
     @abstractmethod
-    def convert_ids_to_tokens(self,
-                              ids: Union[int, List[int]],
-                              skip_special_tokens: bool = False) -> Union[str, List[str]]:
+    def convert_ids_to_tokens(self, ids: int | list[int], skip_special_tokens: bool = False) -> str | list[str]:
         """
         Converts a single index or a sequence of indices in a token or a sequence of tokens, using the vocabulary and
         added tokens.
@@ -132,7 +133,7 @@ class HybridEngineBaseTokenizer(ABC):
         pass
 
     @abstractmethod
-    def get_added_vocab(self) -> Dict[str, int]:
+    def get_added_vocab(self) -> dict[str, int]:
         """
         Returns the added tokens in the vocabulary as a dictionary of token to index. Results might be different from
         the fast call because for now we always add the tokens even if they are already in the vocabulary. This is
@@ -144,7 +145,7 @@ class HybridEngineBaseTokenizer(ABC):
         pass
 
     @abstractmethod
-    def convert_tokens_to_string(self, tokens: List[str]) -> str:
+    def convert_tokens_to_string(self, tokens: list[str]) -> str:
         """
         Converts a sequence of tokens in a single string. The most simple way to do it is `" ".join(tokens)` but we
         often want to remove sub-word tokenization artifacts at the same time.
